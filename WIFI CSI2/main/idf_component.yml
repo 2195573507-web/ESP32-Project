@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf:
+    version: '>=4.1.0'
+  espressif/esp_csi_gain_ctrl: ^0.1.5
+  espp/ping: ^1.0.36
+  espressif/console_cmd_ping: ^1.2.0

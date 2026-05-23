@@ -1,0 +1,24 @@
+# ESP-IDF build outputs
+build/
+**/build/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Editor and local machine files
+.vscode/
+.idea/
+*.code-workspace
+
+# Local environment / secret files
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# OS files
+Thumbs.db
+Desktop.ini
