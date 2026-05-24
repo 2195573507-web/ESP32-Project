@@ -4,7 +4,6 @@
 #include "esp_timer.h"
 
 #include <math.h>
-#include <stdlib.h>
 #include <string.h>
 
 // 原始 CSI 最大处理长度。和 monitor 中的原始打印缓存保持一致。
@@ -28,7 +27,7 @@ typedef enum {
 /**
  * @brief CSI 算法内部跨帧状态。
  *
- * 调用方法：本文件只保存 RAW 主算法状态；官方补偿只用于 gain 冻结。
+ * 调用方法：本文件只保存 RAW 主算法状态；ESPectre-like 算法在独立模块中维护状态。
  */
 typedef struct {
     float last_mean_amp;                         // 上一帧幅值均值，用于冻结判断。
@@ -49,10 +48,6 @@ typedef struct {
     uint16_t stable_offset_count;                // 稳定但偏离旧 baseline 的连续帧数。
     int64_t last_motion_time_ms;                 // 最近一次仍认为有运动的时间，单位 ms。
     int64_t recover_start_time_ms;               // 进入 recover 的时间，单位 ms。
-    uint8_t gain_freeze_count;                   // 增益跳变后的冻结帧计数。
-    uint8_t last_agc_gain;                       // 上一次 AGC 增益。
-    int8_t last_fft_gain;                        // 上一次 FFT 增益。
-    bool has_last_gain;                          // 是否已有上一帧增益状态。
     csi_motion_fsm_state_t state;                // 当前内部 static/motion/recover 状态机状态。
     csi_subband_analysis_state_t subband_state;  // 子频段跨帧平滑状态，不修改主 baseline。
     uint32_t frame_count;                        // 已处理帧计数。
@@ -319,41 +314,6 @@ static void csi_subband_override_bands(csi_subband_analysis_result_t *subband, c
 }
 
 /**
- * @brief 检查增益是否突变，并更新冻结帧计数。
- *
- * 调用方法：RAW 主算法每帧传入当前增益状态，用于冻结 motion 和 baseline 更新。
- */
-static bool csi_update_gain_freeze(csi_processor_state_t *state, const csi_processor_gain_t *gain)
-{
-    if (state == NULL || gain == NULL) {
-        return false;
-    }
-
-    bool gain_changed = false;
-    if (state->has_last_gain) {
-        int agc_diff = (int)gain->agc_gain - (int)state->last_agc_gain;
-        int fft_diff = (int)gain->fft_gain - (int)state->last_fft_gain;
-        gain_changed = (abs(agc_diff) >= CSI_GAIN_AGC_CHANGE_TH) ||
-                       (abs(fft_diff) >= CSI_GAIN_FFT_CHANGE_TH);
-    }
-
-    if (gain_changed && state->gain_freeze_count == 0) {
-        state->gain_freeze_count = CSI_GAIN_FREEZE_FRAMES;
-    }
-
-    bool gain_freezing = state->gain_freeze_count > 0;
-    if (state->gain_freeze_count > 0) {
-        state->gain_freeze_count--;
-    }
-
-    state->last_agc_gain = gain->agc_gain;
-    state->last_fft_gain = gain->fft_gain;
-    state->has_last_gain = true;
-
-    return gain_freezing;
-}
-
-/**
  * @brief 清理运动状态退出时的平滑尾巴。
  *
  * 调用方法：状态机从 motion/recover 回到 static 或进入 recover 时调用，
@@ -458,7 +418,6 @@ static bool csi_processor_process_with_state(csi_processor_state_t *state,
                                              const int8_t *data,
                                              uint16_t len,
                                              bool first_word_invalid,
-                                             const csi_processor_gain_t *gain,
                                              csi_processor_result_t *result)
 {
     if (state == NULL || result == NULL) {
@@ -504,7 +463,6 @@ static bool csi_processor_process_with_state(csi_processor_state_t *state,
                                                        state->baseline_norm_values,
                                                        valid_points,
                                                        state->baseline_norm_count);
-    bool gain_freeze = csi_update_gain_freeze(state, gain);
     float baseline_delta_change = state->has_last_baseline_delta ?
                                   fabsf(baseline_delta - state->last_baseline_delta) :
                                   0.0f;
@@ -526,7 +484,7 @@ static bool csi_processor_process_with_state(csi_processor_state_t *state,
     state->last_var_amp = var_amp;
 
     bool frozen = state->freeze_count >= CSI_FREEZE_FRAME_THRESHOLD;
-    bool update_blocked = frozen || gain_freeze;
+    bool update_blocked = frozen;
     if (!update_blocked) {
         if (state->frame_count == 0) {
             state->smooth_mean_amp = mean_amp;
@@ -544,6 +502,7 @@ static bool csi_processor_process_with_state(csi_processor_state_t *state,
     float global_norm_score = motion_score;
     float subband_norm_score = 0.0f;
     csi_state_t subband_state_id = CSI_STATE_UNKNOWN;
+    csi_espectre_like_process(norm_values, valid_points, &result->espectre);
 #if CSI_ENABLE_SUBBAND_ANALYSIS
     csi_subband_config_t subband_config = {
         .motion_threshold = CSI_MOTION_ON_THRESHOLD * 0.85f,
@@ -634,8 +593,8 @@ static bool csi_processor_process_with_state(csi_processor_state_t *state,
         }
     }
 
-    bool moving_now = !gain_freeze && state->state == CSI_FSM_MOTION;
-    bool recovering = !gain_freeze && state->state == CSI_FSM_RECOVER;
+    bool moving_now = state->state == CSI_FSM_MOTION;
+    bool recovering = state->state == CSI_FSM_RECOVER;
     /*
      * global_state_id 表示旧全局归一化主状态机结果；
      * subband_state_id 表示本地频段分离算法整体结果；
@@ -643,9 +602,7 @@ static bool csi_processor_process_with_state(csi_processor_state_t *state,
      * decision_state_id 表示当前 CSI_DECISION_MODE 最终对外采用的状态。
      */
     csi_state_t global_state_id = csi_fsm_to_public_state(state->state);
-    if (gain_freeze) {
-        global_state_id = CSI_STATE_GAIN_FREEZE;
-    } else if (frozen) {
+    if (frozen) {
         global_state_id = CSI_STATE_DATA_FROZEN;
     }
 
@@ -654,17 +611,7 @@ static bool csi_processor_process_with_state(csi_processor_state_t *state,
         decision_state_id = global_state_id;
     }
 
-    if (gain_freeze) {
-        decision_state_id = CSI_STATE_GAIN_FREEZE;
-        subband_state_id = CSI_STATE_GAIN_FREEZE;
-        fusion_state_id = CSI_STATE_GAIN_FREEZE;
-#if CSI_ENABLE_SUBBAND_ANALYSIS
-        /*
-         * gain_freeze 是全局异常状态，此时局部 band 判断不可靠，统一覆盖 band state。
-         */
-        csi_subband_override_bands(&result->subband, CSI_STATE_GAIN_FREEZE);
-#endif
-    } else if (frozen) {
+    if (frozen) {
         decision_state_id = CSI_STATE_DATA_FROZEN;
         subband_state_id = CSI_STATE_DATA_FROZEN;
         fusion_state_id = CSI_STATE_DATA_FROZEN;
@@ -693,7 +640,6 @@ static bool csi_processor_process_with_state(csi_processor_state_t *state,
     result->amp_motion_score = 0.0f;
     result->freeze_count = state->freeze_count;
     result->frozen = frozen;
-    result->gain_frozen = gain_freeze;
     result->recovering = recovering;
     result->motion = moving_now;
     result->state = decision_state_id;
@@ -713,8 +659,7 @@ static bool csi_processor_process_with_state(csi_processor_state_t *state,
 bool csi_processor_process(const int8_t *data,
                            uint16_t len,
                            bool first_word_invalid,
-                           const csi_processor_gain_t *gain,
                            csi_processor_result_t *result)
 {
-    return csi_processor_process_with_state(&s_raw_processor, data, len, first_word_invalid, gain, result);
+    return csi_processor_process_with_state(&s_raw_processor, data, len, first_word_invalid, result);
 }

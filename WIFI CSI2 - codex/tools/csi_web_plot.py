@@ -22,7 +22,7 @@ CSI_STATE_TEXT = {
     2: "active",
     3: "motion",
     4: "offset",
-    5: "gain_freeze",
+    5: "reserved_5",
     6: "data_frozen",
     7: "recover",
 }
@@ -49,10 +49,6 @@ class CsiFeature:
     motion_state: str
     decision_state_id: int
     decision_state_text: str
-    agc_gain: int = 0
-    fft_gain: int = 0
-    compensate_gain: float = 1.0
-    gain_compensated: bool = False
     decision_mode: int = 0
     global_norm_score: float = 0.0
     global_state_id: int = 0
@@ -66,19 +62,28 @@ class CsiFeature:
     decision_score: float = 0.0
     subband_count: int = 0
     best_band: int = -1
+    espectre_score: float = 0.0
+    espectre_state_id: int = 0
+    espectre_state_text: str = "unknown"
+    espectre_calibrating: bool = True
+    espectre_selected_count: int = 0
+    espectre_best_index: int = -1
+    espectre_turbulence: float = 0.0
+    espectre_mvs: float = 0.0
+    espectre_threshold: float = 0.0
+    espectre_nbvi: float = 0.0
     bands: list[dict] | None = None
 
 
 @dataclass
 class CsiDebug:
     frame: int
-    agc_gain: int
-    fft_gain: int
-    compensate_gain: float
     delta_norm: float
-    motion_score: float
+    global_score: float
     baseline_delta: float
-    amp_motion: float = 0.0
+    subband_score: float
+    espectre_score: float
+    espectre_turbulence: float
 
 
 class PlotState:
@@ -87,6 +92,8 @@ class PlotState:
         self.clients: list[queue.Queue[dict]] = []
         self.status = "waiting for serial port"
         self.port = ""
+        self.feature_count = 0
+        self.serial_line_count = 0
 
     def publish(self, item: dict) -> None:
         with self.lock:
@@ -100,7 +107,13 @@ class PlotState:
         client: queue.Queue[dict] = queue.Queue(maxsize=200)
         with self.lock:
             self.clients.append(client)
-            client.put_nowait({"type": "status", "status": self.status, "port": self.port})
+            client.put_nowait({
+                "type": "status",
+                "status": self.status,
+                "port": self.port,
+                "feature_count": self.feature_count,
+                "serial_line_count": self.serial_line_count,
+            })
         return client
 
     def remove_client(self, client: queue.Queue[dict]) -> None:
@@ -111,7 +124,37 @@ class PlotState:
     def set_status(self, status: str, port: str = "") -> None:
         self.status = status
         self.port = port
-        self.publish({"type": "status", "status": status, "port": port})
+        self.publish({
+            "type": "status",
+            "status": status,
+            "port": port,
+            "feature_count": self.feature_count,
+            "serial_line_count": self.serial_line_count,
+        })
+
+    def set_serial_line_count(self, serial_line_count: int, status: str | None = None) -> None:
+        self.serial_line_count = serial_line_count
+        if status is not None:
+            self.status = status
+        self.publish({
+            "type": "status",
+            "status": self.status,
+            "port": self.port,
+            "feature_count": self.feature_count,
+            "serial_line_count": self.serial_line_count,
+        })
+
+    def set_feature_count(self, feature_count: int, status: str | None = None) -> None:
+        self.feature_count = feature_count
+        if status is not None:
+            self.status = status
+        self.publish({
+            "type": "status",
+            "status": self.status,
+            "port": self.port,
+            "feature_count": self.feature_count,
+            "serial_line_count": self.serial_line_count,
+        })
 
 
 def parse_state_id(value: str) -> int:
@@ -138,18 +181,7 @@ def parse_csi_feature(line: str) -> CsiFeature | None:
         return None
 
     try:
-        if len(parts) >= 20:
-            agc_gain = int(parts[15])
-            fft_gain = int(parts[16])
-            compensate_gain = float(parts[17])
-            gain_compensated = parts[18].strip() == "1"
-            decision_state_id = parse_state_id(parts[19].strip())
-        else:
-            agc_gain = 0
-            fft_gain = 0
-            compensate_gain = 1.0
-            gain_compensated = False
-            decision_state_id = parse_state_id(parts[15].strip())
+        decision_state_id = parse_state_id(parts[15].strip())
 
         decision_mode = 0
         global_norm_score = 0.0
@@ -161,24 +193,42 @@ def parse_csi_feature(line: str) -> CsiFeature | None:
         decision_score = 0.0
         subband_count = 0
         best_band = -1
+        espectre_score = 0.0
+        espectre_state_id = 0
+        espectre_calibrating = True
+        espectre_selected_count = 0
+        espectre_best_index = -1
+        espectre_turbulence = 0.0
+        espectre_mvs = 0.0
+        espectre_threshold = 0.0
+        espectre_nbvi = 0.0
         bands = [
             {"delta": 0.0, "base": 0.0, "score": 0.0, "state_id": 0, "state_text": "unknown"}
             for _ in range(4)
         ]
 
-        if len(parts) >= 47:
-            decision_mode = int(parts[20])
-            global_norm_score = float(parts[21])
-            global_state_id = parse_state_id(parts[22])
-            subband_norm_score = float(parts[23])
-            subband_state_id = parse_state_id(parts[24])
-            fusion_score = float(parts[25])
-            fusion_state_id = parse_state_id(parts[26])
-            decision_score = float(parts[27])
-            decision_state_id = parse_state_id(parts[28])
-            subband_count = int(parts[29])
-            best_band = int(parts[30])
-            index = 31
+        if len(parts) >= 52:
+            decision_mode = int(parts[16])
+            global_norm_score = float(parts[17])
+            global_state_id = parse_state_id(parts[18])
+            subband_norm_score = float(parts[19])
+            subband_state_id = parse_state_id(parts[20])
+            fusion_score = float(parts[21])
+            fusion_state_id = parse_state_id(parts[22])
+            decision_score = float(parts[23])
+            decision_state_id = parse_state_id(parts[24])
+            subband_count = int(parts[25])
+            best_band = int(parts[26])
+            espectre_score = float(parts[27])
+            espectre_state_id = parse_state_id(parts[28])
+            espectre_calibrating = parts[29].strip() == "1"
+            espectre_selected_count = int(parts[30])
+            espectre_best_index = int(parts[31])
+            espectre_turbulence = float(parts[32])
+            espectre_mvs = float(parts[33])
+            espectre_threshold = float(parts[34])
+            espectre_nbvi = float(parts[35])
+            index = 36
             for band_index in range(4):
                 state_id = parse_state_id(parts[index + 3])
                 bands[band_index] = {
@@ -210,10 +260,6 @@ def parse_csi_feature(line: str) -> CsiFeature | None:
             motion_state=decision_state_text,
             decision_state_id=decision_state_id,
             decision_state_text=decision_state_text,
-            agc_gain=agc_gain,
-            fft_gain=fft_gain,
-            compensate_gain=compensate_gain,
-            gain_compensated=gain_compensated,
             decision_mode=decision_mode,
             global_norm_score=global_norm_score,
             global_state_id=global_state_id,
@@ -227,6 +273,16 @@ def parse_csi_feature(line: str) -> CsiFeature | None:
             decision_score=decision_score,
             subband_count=subband_count,
             best_band=best_band,
+            espectre_score=espectre_score,
+            espectre_state_id=espectre_state_id,
+            espectre_state_text=state_text_from_id(espectre_state_id),
+            espectre_calibrating=espectre_calibrating,
+            espectre_selected_count=espectre_selected_count,
+            espectre_best_index=espectre_best_index,
+            espectre_turbulence=espectre_turbulence,
+            espectre_mvs=espectre_mvs,
+            espectre_threshold=espectre_threshold,
+            espectre_nbvi=espectre_nbvi,
             bands=bands,
         )
     except (ValueError, IndexError):
@@ -238,19 +294,18 @@ def parse_csi_dbg(line: str) -> CsiDebug | None:
         return None
 
     parts = line.split(",")
-    if len(parts) not in (8, 9):
+    if len(parts) != 8:
         return None
 
     try:
         return CsiDebug(
             frame=int(parts[1]),
-            agc_gain=int(parts[2]),
-            fft_gain=int(parts[3]),
-            compensate_gain=float(parts[4]),
-            delta_norm=float(parts[5]),
-            motion_score=float(parts[6]),
-            baseline_delta=float(parts[7]),
-            amp_motion=float(parts[8]) if len(parts) == 9 else 0.0,
+            delta_norm=float(parts[2]),
+            global_score=float(parts[3]),
+            baseline_delta=float(parts[4]),
+            subband_score=float(parts[5]),
+            espectre_score=float(parts[6]),
+            espectre_turbulence=float(parts[7]),
         )
     except ValueError:
         return None
@@ -292,33 +347,60 @@ def find_serial_port() -> str | None:
     return non_bluetooth[0] if len(non_bluetooth) == 1 else None
 
 
+def list_serial_port_candidates() -> str:
+    import serial.tools.list_ports
+
+    ports = list(serial.tools.list_ports.comports())
+    available = []
+    for port in ports:
+        text = f"{port.device} {port.description} {port.manufacturer or ''}".lower()
+        if any(skip in text for skip in SKIP_SERIAL_KEYWORDS):
+            continue
+        available.append(f"{port.device}({port.description})")
+    return ", ".join(available)
+
+
 def serial_loop(args: argparse.Namespace, state: PlotState, stop_event: threading.Event) -> None:
-    import serial
+    try:
+        import serial
+    except ModuleNotFoundError:
+        state.set_status("pyserial missing; activate ESP-IDF python environment")
+        return
 
     while not stop_event.is_set():
         port = args.port or find_serial_port()
         if not port:
-            state.set_status("waiting for ESP32-C5 serial port")
+            available = list_serial_port_candidates()
+            if available:
+                state.set_status(f"waiting for ESP32-C5 serial port; available: {available}")
+            else:
+                state.set_status("waiting for ESP32-C5 serial port")
             time.sleep(1.0)
             continue
 
         try:
-            state.set_status("opening serial", port)
+            state.set_status("opening serial port", port)
             with serial.Serial(port, args.baud, timeout=0.2) as ser:
-                state.set_status("receiving CSI_FEATURE", port)
+                state.set_status("waiting for CSI_FEATURE_RAW frames", port)
+                serial_line_count = 0
+                feature_count = 0
                 while not stop_event.is_set():
                     raw_line = ser.readline()
                     if not raw_line:
                         continue
 
+                    serial_line_count += 1
                     line = raw_line.decode("utf-8", errors="ignore").strip()
                     link = parse_csi_link(line)
                     if link is not None:
+                        state.set_serial_line_count(serial_line_count, "serial text received, waiting for CSI_FEATURE_RAW")
                         state.publish(link)
                         continue
 
                     debug = parse_csi_dbg(line)
                     if debug is not None:
+                        if feature_count == 0:
+                            state.set_serial_line_count(serial_line_count, "serial text received, waiting for CSI_FEATURE_RAW")
                         item = asdict(debug)
                         item["type"] = "debug"
                         state.publish(item)
@@ -326,7 +408,15 @@ def serial_loop(args: argparse.Namespace, state: PlotState, stop_event: threadin
 
                     feature = parse_csi_feature(line)
                     if feature is None:
+                        if serial_line_count == 1 or (feature_count == 0 and serial_line_count % 50 == 0):
+                            state.set_serial_line_count(serial_line_count, "serial text received, waiting for CSI_FEATURE_RAW")
                         continue
+
+                    feature_count += 1
+                    if feature_count == 1:
+                        state.set_feature_count(feature_count, f"receiving CSI_FEATURE_RAW frames")
+                    else:
+                        state.set_feature_count(feature_count)
 
                     item = asdict(feature)
                     item["type"] = "feature"
@@ -445,11 +535,8 @@ HTML = r"""<!doctype html>
     #humanState.offset { background: #0f766e; }
     #humanState.recover { background: var(--recover); }
     #humanState.data_frozen { background: var(--freeze); }
-    #humanState.gain_freeze { background: var(--warn); }
+    #humanState.reserved_5 { background: var(--warn); }
     #humanState.unknown { background: #475467; }
-    #gainState { background: var(--warn); color: white; }
-    #gainState.ready { background: var(--ok); }
-    #gainState.collect { background: var(--warn); }
     main {
       min-height: calc(100vh - 58px);
       min-width: 0;
@@ -639,7 +726,7 @@ HTML = r"""<!doctype html>
     <div class="header-right">
       <div id="wifiName" class="chip">WiFi 等待中</div>
       <div id="humanState" class="chip">状态 等待中</div>
-      <div id="gainState" class="chip">增益 等待中</div>
+      <div id="espectreState" class="chip">ESPectre 校准中</div>
       <button id="pauseBtn" type="button">暂停</button>
       <div id="status" class="chip">connecting...</div>
     </div>
@@ -653,46 +740,44 @@ HTML = r"""<!doctype html>
       <div class="metric"><span>baseline</span><span id="vBaselineDelta">--</span></div>
       <div class="metric"><span>motion</span><span id="vMotionScore">--</span></div>
       <div class="metric"><span>smooth</span><span id="vSmoothMotionScore">--</span></div>
-      <div class="metric"><span>AGC</span><span id="vAgcGain">--</span></div>
-      <div class="metric"><span>FFT</span><span id="vFftGain">--</span></div>
-      <div class="metric"><span>comp</span><span id="vCompensateGain">--</span></div>
       <div class="metric"><span>decision mode</span><span id="vDecisionMode">--</span></div>
       <div class="metric"><span>decision score</span><span id="vDecisionScore">--</span></div>
       <div class="metric"><span>global score</span><span id="vGlobalScore">--</span></div>
       <div class="metric"><span>global state</span><span id="vGlobalState">--</span></div>
       <div class="metric"><span>subband score</span><span id="vSubbandScore">--</span></div>
       <div class="metric"><span>subband state</span><span id="vSubbandState">--</span></div>
-      <div class="metric"><span>fusion score</span><span id="vFusionScore">--</span></div>
-      <div class="metric"><span>fusion state</span><span id="vFusionState">--</span></div>
+      <div class="metric"><span>ESPectre score</span><span id="vEspectreScore">--</span></div>
+      <div class="metric"><span>ESPectre state</span><span id="vEspectreState">--</span></div>
+      <div class="metric"><span>ESPectre select</span><span id="vEspectreSelect">--</span></div>
+      <div class="metric"><span>ESPectre threshold</span><span id="vEspectreThreshold">--</span></div>
       <div class="metric"><span>best band</span><span id="vBestBand">--</span></div>
     </div>
     <div class="plot-panel">
       <div class="canvas-scroll"><canvas id="rawScore"></canvas></div>
       <div class="plot-readout">
-        <span id="rawReadout" class="readout-text">waiting for RAW...</span>
+        <span id="rawReadout" class="readout-text">waiting for global_norm...</span>
         <label class="axis-control">横轴缩放 <input id="rawXScale" type="number" min="0.5" max="40" step="0.5" value="4"></label>
       </div>
       <div class="legend">
-        <span class="legend-title">RAW 特征</span>
+        <span class="legend-title">Global Norm 判断</span>
         <span class="item" style="--c:#1f77b4">delta</span>
         <span class="item" style="--c:#ff7f0e">baseline</span>
-        <span class="item" style="--c:#2ca02c">motion</span>
+        <span class="item" style="--c:#2ca02c">global</span>
         <span class="item" style="--c:#9467bd">smooth</span>
       </div>
     </div>
     <div class="plot-panel">
-      <div class="canvas-scroll"><canvas id="gainDebug"></canvas></div>
+      <div class="canvas-scroll"><canvas id="algoDebug"></canvas></div>
       <div class="plot-readout">
-        <span id="debugReadout" class="readout-text">waiting for CSI_DBG...</span>
+        <span id="debugReadout" class="readout-text">waiting for ESPectre-like...</span>
         <label class="axis-control">横轴缩放 <input id="debugXScale" type="number" min="0.5" max="40" step="0.5" value="4"></label>
       </div>
       <div class="legend">
-        <span class="legend-title">DBG 诊断</span>
-        <span class="item" style="--c:#2ca02c">motion</span>
-        <span class="item" style="--c:#ff7f0e">baseline</span>
-        <span class="item" style="--c:#17becf">comp</span>
-        <span class="item" style="--c:#d62728">agc</span>
-        <span class="item" style="--c:#9467bd">fft</span>
+        <span class="legend-title">ESPectre-like 判断</span>
+        <span class="item" style="--c:#7c3aed">score</span>
+        <span class="item" style="--c:#0891b2">turbulence</span>
+        <span class="item" style="--c:#f97316">sqrt(mvs)</span>
+        <span class="item" style="--c:#475467">threshold</span>
       </div>
     </div>
     <div class="plot-panel">
@@ -724,7 +809,7 @@ HTML = r"""<!doctype html>
         <label class="axis-control">横轴缩放 <input id="bandXScale" type="number" min="0.5" max="40" step="0.5" value="4"></label>
       </div>
       <div class="legend">
-        <span class="legend-title">频段得分</span>
+        <span class="legend-title">Subband Norm 判断</span>
         <span class="item" style="--c:#2563eb">band0</span>
         <span class="item" style="--c:#f97316">band1</span>
         <span class="item" style="--c:#16a34a">band2</span>
@@ -738,16 +823,15 @@ HTML = r"""<!doctype html>
     const smoothSamples = __SMOOTH_SAMPLES__;
     const scoreMaxOverride = __SCORE_MAX__;
     const rawData = [];
-    const debugData = [];
     let paused = false;
 
     const statusEl = document.getElementById("status");
     const wifiNameEl = document.getElementById("wifiName");
     const humanStateEl = document.getElementById("humanState");
-    const gainStateEl = document.getElementById("gainState");
+    const espectreStateEl = document.getElementById("espectreState");
     const pauseBtn = document.getElementById("pauseBtn");
     const rawScoreCanvas = document.getElementById("rawScore");
-    const gainDebugCanvas = document.getElementById("gainDebug");
+    const algoDebugCanvas = document.getElementById("algoDebug");
     const rssiCanvas = document.getElementById("rssiPlot");
     const bandScoreCanvas = document.getElementById("bandScorePlot");
     const rawReadoutEl = document.getElementById("rawReadout");
@@ -768,17 +852,16 @@ HTML = r"""<!doctype html>
       baselineDelta: document.getElementById("vBaselineDelta"),
       motionScore: document.getElementById("vMotionScore"),
       smoothMotionScore: document.getElementById("vSmoothMotionScore"),
-      agcGain: document.getElementById("vAgcGain"),
-      fftGain: document.getElementById("vFftGain"),
-      compensateGain: document.getElementById("vCompensateGain"),
       decisionMode: document.getElementById("vDecisionMode"),
       decisionScore: document.getElementById("vDecisionScore"),
       globalScore: document.getElementById("vGlobalScore"),
       globalState: document.getElementById("vGlobalState"),
       subbandScore: document.getElementById("vSubbandScore"),
       subbandState: document.getElementById("vSubbandState"),
-      fusionScore: document.getElementById("vFusionScore"),
-      fusionState: document.getElementById("vFusionState"),
+      espectreScore: document.getElementById("vEspectreScore"),
+      espectreState: document.getElementById("vEspectreState"),
+      espectreSelect: document.getElementById("vEspectreSelect"),
+      espectreThreshold: document.getElementById("vEspectreThreshold"),
       bestBand: document.getElementById("vBestBand"),
     };
     const STATE_STYLES = {
@@ -787,7 +870,7 @@ HTML = r"""<!doctype html>
       active: {shortLabel: "active", chipClass: "active", fillColor: "rgba(245, 158, 11, 0.16)", textColor: "#b45309"},
       offset: {shortLabel: "offset", chipClass: "offset", fillColor: "rgba(20, 184, 166, 0.16)", textColor: "#0f766e"},
       recover: {shortLabel: "recover", chipClass: "recover", fillColor: "rgba(29, 78, 216, 0.18)", textColor: "#1d4ed8"},
-      gain_freeze: {shortLabel: "gain freeze", chipClass: "gain_freeze", fillColor: "rgba(133, 77, 14, 0.24)", textColor: "#92400e"},
+      reserved_5: {shortLabel: "reserved", chipClass: "reserved_5", fillColor: "rgba(133, 77, 14, 0.16)", textColor: "#92400e"},
       data_frozen: {shortLabel: "data frozen", chipClass: "data_frozen", fillColor: "rgba(109, 40, 217, 0.22)", textColor: "#6d28d9"},
       unknown: {shortLabel: "unknown", chipClass: "unknown", fillColor: "rgba(71, 84, 103, 0.10)", textColor: "#475467"},
     };
@@ -932,10 +1015,12 @@ HTML = r"""<!doctype html>
       humanStateEl.className = "chip";
       humanStateEl.classList.add(style.chipClass);
     }
-    function updateGainState(row) {
-      const ready = row.gain_compensated === true;
-      gainStateEl.textContent = `Gain ${ready ? "ready" : "collecting"} x${fmt(row.compensate_gain, 3)}`;
-      gainStateEl.className = ready ? "chip ready" : "chip collect";
+    function updateEspectreState(row) {
+      const stateText = row.espectre_calibrating ? "calibrating" : (row.espectre_state_text || "unknown");
+      const style = row.espectre_calibrating ? STATE_STYLES.active : getStateStyle(row.espectre_state_text);
+      espectreStateEl.textContent = `ESPectre ${stateText}`;
+      espectreStateEl.className = "chip";
+      espectreStateEl.classList.add(style.chipClass);
     }
     function updateMetricValues(row) {
       metricEls.frame.textContent = row.frame;
@@ -946,17 +1031,16 @@ HTML = r"""<!doctype html>
       metricEls.baselineDelta.textContent = fmt(row.baseline_delta);
       metricEls.motionScore.textContent = fmt(row.motion_score);
       metricEls.smoothMotionScore.textContent = fmt(row.smooth_motion_score);
-      metricEls.agcGain.textContent = row.agc_gain ?? "--";
-      metricEls.fftGain.textContent = row.fft_gain ?? "--";
-      metricEls.compensateGain.textContent = fmt(row.compensate_gain, 4);
       metricEls.decisionMode.textContent = DECISION_MODES[row.decision_mode] || String(row.decision_mode ?? 0);
       metricEls.decisionScore.textContent = fmt(row.decision_score);
       metricEls.globalScore.textContent = fmt(row.global_norm_score);
       metricEls.globalState.textContent = `${row.global_state_id ?? 0} ${row.global_state_text || "unknown"}`;
       metricEls.subbandScore.textContent = fmt(row.subband_norm_score);
       metricEls.subbandState.textContent = `${row.subband_state_id ?? 0} ${row.subband_state_text || "unknown"}`;
-      metricEls.fusionScore.textContent = fmt(row.fusion_score);
-      metricEls.fusionState.textContent = `${row.fusion_state_id ?? 0} ${row.fusion_state_text || "unknown"}`;
+      metricEls.espectreScore.textContent = fmt(row.espectre_score);
+      metricEls.espectreState.textContent = `${row.espectre_state_id ?? 0} ${row.espectre_state_text || "unknown"}`;
+      metricEls.espectreSelect.textContent = `${row.espectre_selected_count ?? 0} @ ${row.espectre_best_index ?? -1}`;
+      metricEls.espectreThreshold.textContent = fmt(row.espectre_threshold);
       metricEls.bestBand.textContent = Number.isFinite(row.best_band) && row.best_band >= 0 ? `Band${row.best_band}` : "--";
     }
     function updateBandCards(row) {
@@ -980,43 +1064,70 @@ HTML = r"""<!doctype html>
       const {ctx, width, height} = resizeCanvas(rawScoreCanvas);
       drawGrid(ctx, width, height, rawData);
       if (!rawData.length) {
-        drawText(ctx, "waiting for RAW...", 58, 36);
-        rawReadoutEl.textContent = "waiting for RAW...";
+        drawText(ctx, "waiting for global_norm...", 58, 36);
+        rawReadoutEl.textContent = "waiting for global_norm...";
         return;
       }
-      const keys = ["delta_norm", "baseline_delta", "motion_score", "smooth_motion_score"];
-      const rows = smoothedRows(rawData, keys, smoothSamples);
+      const globalRows = rawData.map(row => ({
+        frame: row.frame,
+        motion_state: row.global_state_text || "unknown",
+        delta_norm: row.delta_norm,
+        baseline_delta: row.baseline_delta,
+        global_norm_score: row.global_norm_score,
+        smooth_motion_score: row.smooth_motion_score,
+        global_state_id: row.global_state_id,
+        global_state_text: row.global_state_text,
+      }));
+      const keys = ["delta_norm", "baseline_delta", "global_norm_score", "smooth_motion_score"];
+      const rows = smoothedRows(globalRows, keys, smoothSamples);
       const values = [];
       rows.forEach(row => keys.forEach(key => values.push(Number(row[key] || 0))));
       const maxScore = scoreMaxOverride > 0 ? scoreMaxOverride : Math.max(0.02, percentile(values, 0.98) * 1.35);
-      drawStateRegions(ctx, rawData, width, height);
+      drawStateRegions(ctx, globalRows, width, height);
       drawSeries(ctx, rows, "delta_norm", "#1f77b4", 0, maxScore, width, height, 1.2);
       drawSeries(ctx, rows, "baseline_delta", "#ff7f0e", 0, maxScore, width, height, 1.2);
-      drawSeries(ctx, rows, "motion_score", "#2ca02c", 0, maxScore, width, height, 1.4);
+      drawSeries(ctx, rows, "global_norm_score", "#2ca02c", 0, maxScore, width, height, 1.4);
       drawSeries(ctx, rows, "smooth_motion_score", "#9467bd", 0, maxScore, width, height, 2.0);
-      const last = rawData[rawData.length - 1];
-      rawReadoutEl.textContent = `RAW f=${last.frame} state=${last.decision_state_id} ${last.decision_state_text} rssi=${last.rssi}`;
-      rawReadoutEl.style.color = getStateStyle(last.motion_state).textColor;
+      const last = globalRows[globalRows.length - 1];
+      rawReadoutEl.textContent = `global_norm f=${last.frame} state=${last.global_state_id} ${last.global_state_text} score=${fmt(last.global_norm_score)} baseline=${fmt(last.baseline_delta)}`;
+      rawReadoutEl.style.color = getStateStyle(last.global_state_text).textColor;
     }
     function drawDebugPanel() {
-      updateCanvasWidth(gainDebugCanvas, debugData, readXScale(debugXScaleEl));
-      const {ctx, width, height} = resizeCanvas(gainDebugCanvas);
-      drawGrid(ctx, width, height, debugData);
-      if (!debugData.length) {
-        drawText(ctx, "waiting for CSI_DBG...", 58, 36);
-        debugReadoutEl.textContent = "waiting for CSI_DBG...";
+      updateCanvasWidth(algoDebugCanvas, rawData, readXScale(debugXScaleEl));
+      const {ctx, width, height} = resizeCanvas(algoDebugCanvas);
+      drawGrid(ctx, width, height, rawData);
+      if (!rawData.length) {
+        drawText(ctx, "waiting for ESPectre-like...", 58, 36);
+        debugReadoutEl.textContent = "waiting for ESPectre-like...";
         return;
       }
-      const keys = ["motion_score", "baseline_delta", "compensate_gain", "agc_gain", "fft_gain"];
-      const rows = smoothedRows(debugData, keys, smoothSamples);
-      const maxScore = scoreMaxOverride > 0 ? scoreMaxOverride : Math.max(0.02, percentile(rows.flatMap(row => [row.motion_score, row.baseline_delta]), 0.98) * 1.3);
-      drawSeries(ctx, rows, "motion_score", "#2ca02c", 0, maxScore, width, height, 1.8);
-      drawSeries(ctx, rows, "baseline_delta", "#ff7f0e", 0, maxScore, width, height, 1.5);
-      drawSeries(ctx, rows, "compensate_gain", "#17becf", ...rangeFor(rows, "compensate_gain", 0.5, 1.5), width, height, 1.3);
-      drawSeries(ctx, rows, "agc_gain", "#d62728", ...rangeFor(rows, "agc_gain", 0, 64), width, height, 1.1);
-      drawSeries(ctx, rows, "fft_gain", "#9467bd", ...rangeFor(rows, "fft_gain", -32, 32), width, height, 1.1);
-      const last = debugData[debugData.length - 1];
-      debugReadoutEl.textContent = `frame=${last.frame} motion=${fmt(last.motion_score)} base=${fmt(last.baseline_delta)} comp=${fmt(last.compensate_gain, 3)} agc=${last.agc_gain} fft=${last.fft_gain}`;
+      const espectreRows = rawData.map(row => ({
+        frame: row.frame,
+        motion_state: row.espectre_calibrating ? "active" : (row.espectre_state_text || "unknown"),
+        espectre_score: row.espectre_score,
+        espectre_turbulence: row.espectre_turbulence,
+        espectre_mvs_root: Math.sqrt(Math.max(0, Number(row.espectre_mvs || 0))),
+        espectre_threshold: row.espectre_threshold,
+        espectre_state_id: row.espectre_state_id,
+        espectre_state_text: row.espectre_state_text,
+        espectre_calibrating: row.espectre_calibrating,
+        espectre_selected_count: row.espectre_selected_count,
+        espectre_best_index: row.espectre_best_index,
+      }));
+      const keys = ["espectre_score", "espectre_turbulence", "espectre_mvs_root", "espectre_threshold"];
+      const rows = smoothedRows(espectreRows, keys, smoothSamples);
+      const values = [];
+      rows.forEach(row => keys.forEach(key => values.push(Number(row[key] || 0))));
+      const maxScore = scoreMaxOverride > 0 ? scoreMaxOverride : Math.max(0.02, percentile(values, 0.98) * 1.3);
+      drawStateRegions(ctx, espectreRows, width, height);
+      drawSeries(ctx, rows, "espectre_score", "#7c3aed", 0, maxScore, width, height, 1.8);
+      drawSeries(ctx, rows, "espectre_turbulence", "#0891b2", 0, maxScore, width, height, 1.2);
+      drawSeries(ctx, rows, "espectre_mvs_root", "#f97316", 0, maxScore, width, height, 1.2);
+      drawSeries(ctx, rows, "espectre_threshold", "#475467", 0, maxScore, width, height, 1.4);
+      const last = espectreRows[espectreRows.length - 1];
+      const stateText = last.espectre_calibrating ? "calibrating" : (last.espectre_state_text || "unknown");
+      debugReadoutEl.textContent = `ESPectre f=${last.frame} state=${last.espectre_state_id} ${stateText} score=${fmt(last.espectre_score)} turb=${fmt(last.espectre_turbulence)} mvs=${fmt(last.espectre_mvs_root)} threshold=${fmt(last.espectre_threshold)} select=${last.espectre_selected_count}@${last.espectre_best_index}`;
+      debugReadoutEl.style.color = getStateStyle(last.motion_state).textColor;
     }
     function drawRssiPanel() {
       updateCanvasWidth(rssiCanvas, rawData, readXScale(rssiXScaleEl));
@@ -1041,12 +1152,15 @@ HTML = r"""<!doctype html>
       drawGrid(ctx, width, height, rawData);
       const bandRows = rawData.filter(hasSubband).map(row => ({
         frame: row.frame,
-        motion_state: row.motion_state,
+        motion_state: row.subband_state_text || "unknown",
         band0_score: row.bands[0]?.score ?? 0,
         band1_score: row.bands[1]?.score ?? 0,
         band2_score: row.bands[2]?.score ?? 0,
         band3_score: row.bands[3]?.score ?? 0,
         subband_norm_score: row.subband_norm_score,
+        subband_state_id: row.subband_state_id,
+        subband_state_text: row.subband_state_text,
+        best_band: row.best_band,
       }));
       if (!bandRows.length) {
         // 兼容旧固件或关闭 subband 的数据流，没有扩展字段时页面不报错。
@@ -1066,7 +1180,8 @@ HTML = r"""<!doctype html>
       drawSeries(ctx, rows, "band3_score", "#9333ea", 0, maxScore, width, height, 1.4);
       drawSeries(ctx, rows, "subband_norm_score", "#dc2626", 0, maxScore, width, height, 2.0);
       const last = bandRows[bandRows.length - 1];
-      bandReadoutEl.textContent = `frame=${last.frame} band0=${fmt(last.band0_score)} band1=${fmt(last.band1_score)} band2=${fmt(last.band2_score)} band3=${fmt(last.band3_score)} subband=${fmt(last.subband_norm_score)}`;
+      bandReadoutEl.textContent = `subband_norm f=${last.frame} state=${last.subband_state_id} ${last.subband_state_text} best=${last.best_band} band0=${fmt(last.band0_score)} band1=${fmt(last.band1_score)} band2=${fmt(last.band2_score)} band3=${fmt(last.band3_score)} score=${fmt(last.subband_norm_score)}`;
+      bandReadoutEl.style.color = getStateStyle(last.subband_state_text).textColor;
     }
     function redraw() {
       drawFeaturePanel();
@@ -1091,7 +1206,10 @@ HTML = r"""<!doctype html>
     events.onmessage = (event) => {
       const msg = JSON.parse(event.data);
       if (msg.type === "status") {
-        statusEl.textContent = `${msg.status}${msg.port ? " - " + msg.port : ""}`;
+        const counts = [];
+        if (Number(msg.feature_count || 0) > 0) counts.push(`frames=${msg.feature_count}`);
+        if (Number(msg.serial_line_count || 0) > 0 && Number(msg.feature_count || 0) === 0) counts.push(`lines=${msg.serial_line_count}`);
+        statusEl.textContent = `${msg.status}${msg.port ? " - " + msg.port : ""}${counts.length ? " - " + counts.join(" ") : ""}`;
       } else if (msg.type === "link") {
         wifiNameEl.textContent = `WiFi ${msg.wifi_ssid || "unknown"}`;
       } else if (msg.type === "feature") {
@@ -1099,13 +1217,9 @@ HTML = r"""<!doctype html>
         rawData.push(msg);
         while (rawData.length > maxPoints) rawData.shift();
         updateHumanState(msg.motion_state);
-        updateGainState(msg);
+        updateEspectreState(msg);
         updateMetricValues(msg);
         updateBandCards(msg);
-      } else if (msg.type === "debug") {
-        if (paused) return;
-        debugData.push(msg);
-        while (debugData.length > maxPoints) debugData.shift();
       }
     };
   </script>
@@ -1177,10 +1291,10 @@ def main() -> None:
 
     state = PlotState()
     stop_event = threading.Event()
+    server = ThreadingHTTPServer((args.host, args.http_port), make_handler(state, args))
     reader = threading.Thread(target=serial_loop, args=(args, state, stop_event), daemon=True)
     reader.start()
 
-    server = ThreadingHTTPServer((args.host, args.http_port), make_handler(state, args))
     url = f"http://{args.host}:{args.http_port}/"
     print(f"CSI plot server: {url}")
     print("连接或复位 ESP32-C5。关闭此窗口即可停止服务。")

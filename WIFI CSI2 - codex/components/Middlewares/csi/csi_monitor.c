@@ -1,7 +1,7 @@
 #include "csi_monitor.h"
 #include "csi_feature.h"
-#include "csi_gain_compensation.h"
 #include "csi_processor.h"
+#include "wifi_manager.h"
 #if CSI_SERIAL_OUTPUT_ENABLE
 #include "csi_serial_output.h"
 #endif
@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 
 #include "esp_check.h"
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -40,7 +41,10 @@ static csi_link_filter_t s_link_filter = {0};
 static volatile uint32_t s_csi_seen_count = 0;
 static volatile uint32_t s_csi_rx_count = 0;
 static csi_feature_t s_latest_feature = {0};
+static portMUX_TYPE s_link_filter_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_feature_lock = portMUX_INITIALIZER_UNLOCKED;
+static esp_ping_handle_t s_internal_ping = NULL;
+static bool s_csi_event_handler_registered = false;
 
 /**
  * @brief 比较两个 MAC 地址是否完全相同。
@@ -82,6 +86,53 @@ static bool csi_mac_is_broadcast(const uint8_t mac[6])
 }
 
 /**
+ * @brief 读取当前 CSI 链路过滤条件快照。
+ *
+ * 调用方法：CSI 回调、串口输出和看门任务需要读取链路状态时调用。
+ * @param filter 输出：当前链路过滤条件。
+ * @return true 表示链路已经就绪，false 表示 WiFi 当前未连接或过滤条件未初始化。
+ */
+static bool csi_link_filter_get(csi_link_filter_t *filter)
+{
+    if (filter == NULL) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&s_link_filter_lock);
+    *filter = s_link_filter;
+    portEXIT_CRITICAL(&s_link_filter_lock);
+
+    return filter->ready;
+}
+
+/**
+ * @brief 清空最近一帧 CSI 快照，避免断线后串口继续输出旧数据。
+ *
+ * 调用方法：WiFi 断开事件处理函数调用。
+ */
+static void csi_latest_feature_clear(void)
+{
+    portENTER_CRITICAL(&s_feature_lock);
+    memset(&s_latest_feature, 0, sizeof(s_latest_feature));
+    s_csi_rx_count = 0;
+    portEXIT_CRITICAL(&s_feature_lock);
+}
+
+/**
+ * @brief 将 CSI 链路标记为不可用。
+ *
+ * 调用方法：WiFi 断开事件处理函数调用，串口输出会因此暂停。
+ */
+static void csi_link_filter_mark_down(void)
+{
+    portENTER_CRITICAL(&s_link_filter_lock);
+    s_link_filter.ready = false;
+    portEXIT_CRITICAL(&s_link_filter_lock);
+
+    csi_latest_feature_clear();
+}
+
+/**
  * @brief 判断 CSI 帧是否属于 AP/路由器发给本机 ESP32-C5 的单播下行包。
  *
  * 调用方法：wifi_csi_rx_cb() 收到每帧 CSI 后调用。
@@ -90,11 +141,13 @@ static bool csi_mac_is_broadcast(const uint8_t mac[6])
  */
 static bool csi_is_router_to_esp_frame(const wifi_csi_info_t *info)
 {
-    if (info == NULL || !s_link_filter.ready) {
+    csi_link_filter_t filter = {0};
+
+    if (info == NULL || !csi_link_filter_get(&filter)) {
         return false;
     }
 
-    if (!csi_mac_equal(info->mac, s_link_filter.ap_bssid)) {
+    if (!csi_mac_equal(info->mac, filter.ap_bssid)) {
         return false;
     }
 
@@ -103,7 +156,7 @@ static bool csi_is_router_to_esp_frame(const wifi_csi_info_t *info)
         return false;
     }
 
-    return csi_mac_equal(info->dmac, s_link_filter.sta_mac);
+    return csi_mac_equal(info->dmac, filter.sta_mac);
 }
 
 /**
@@ -132,25 +185,12 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 
     const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
     csi_processor_result_t raw_processed = {0};
-    csi_gain_compensation_result_t gain = {0};
 
     uint16_t raw_len = info->len > CSI_RAW_MAX_LEN ? CSI_RAW_MAX_LEN : info->len;
-
-    // 先读取官方增益状态，只作为可靠性冻结和辅助幅值特征，不改写 CSI 数据。
-    if (csi_gain_compensation_get_state(rx_ctrl, &gain) != ESP_OK) {
-        return;
-    }
-
-    csi_processor_gain_t processor_gain = {
-        .agc_gain = gain.agc_gain,
-        .fft_gain = gain.fft_gain,
-        .compensate_gain = gain.compensate_gain,
-    };
 
     if (!csi_processor_process(info->buf,
                                raw_len,
                                info->first_word_invalid,
-                               &processor_gain,
                                &raw_processed)) {
         return;
     }
@@ -161,7 +201,6 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         .channel = rx_ctrl->channel,
         .csi_len = info->len,
         .raw_processed = raw_processed,
-        .gain = gain,
         .raw_len = raw_len,
         .sig_mode = 0,
         .mcs = 0,
@@ -190,8 +229,13 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 static bool csi_get_latest_feature(csi_feature_t *feature, uint32_t *count, void *ctx)
 {
     (void)ctx;
+    csi_link_filter_t filter = {0};
 
     if (feature == NULL || count == NULL) {
+        return false;
+    }
+
+    if (!csi_link_filter_get(&filter) || !wifi_is_connected()) {
         return false;
     }
 
@@ -206,14 +250,15 @@ static bool csi_get_latest_feature(csi_feature_t *feature, uint32_t *count, void
 static bool csi_get_serial_link_info(csi_link_info_t *link_info, void *ctx)
 {
     (void)ctx;
+    csi_link_filter_t filter = {0};
 
-    if (link_info == NULL || !s_link_filter.ready) {
+    if (link_info == NULL || !csi_link_filter_get(&filter)) {
         return false;
     }
 
-    memcpy(link_info->ap_bssid, s_link_filter.ap_bssid, sizeof(link_info->ap_bssid));
-    memcpy(link_info->sta_mac, s_link_filter.sta_mac, sizeof(link_info->sta_mac));
-    link_info->gateway_ip = s_link_filter.gateway_ip;
+    memcpy(link_info->ap_bssid, filter.ap_bssid, sizeof(link_info->ap_bssid));
+    memcpy(link_info->sta_mac, filter.sta_mac, sizeof(link_info->sta_mac));
+    link_info->gateway_ip = filter.gateway_ip;
     return true;
 }
 #endif
@@ -231,23 +276,30 @@ static void wifi_csi_watch_task(void *arg)
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
+        csi_link_filter_t filter = {0};
+
+        if (!csi_link_filter_get(&filter)) {
+            ESP_LOGW(TAG, "CSI paused: WiFi link is not ready");
+            last_seen_count = s_csi_seen_count;
+            continue;
+        }
 
         if (s_csi_rx_count == 0) {
             ESP_LOGW(TAG,
                      "No router->ESP32-C5 CSI yet. seen=%lu, filter src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x",
                      (unsigned long)s_csi_seen_count,
-                     s_link_filter.ap_bssid[0],
-                     s_link_filter.ap_bssid[1],
-                     s_link_filter.ap_bssid[2],
-                     s_link_filter.ap_bssid[3],
-                     s_link_filter.ap_bssid[4],
-                     s_link_filter.ap_bssid[5],
-                     s_link_filter.sta_mac[0],
-                     s_link_filter.sta_mac[1],
-                     s_link_filter.sta_mac[2],
-                     s_link_filter.sta_mac[3],
-                     s_link_filter.sta_mac[4],
-                     s_link_filter.sta_mac[5]);
+                     filter.ap_bssid[0],
+                     filter.ap_bssid[1],
+                     filter.ap_bssid[2],
+                     filter.ap_bssid[3],
+                     filter.ap_bssid[4],
+                     filter.ap_bssid[5],
+                     filter.sta_mac[0],
+                     filter.sta_mac[1],
+                     filter.sta_mac[2],
+                     filter.sta_mac[3],
+                     filter.sta_mac[4],
+                     filter.sta_mac[5]);
         } else if (s_csi_seen_count == last_seen_count) {
             ESP_LOGW(TAG, "CSI callback is quiet. Internal ping is running; check WiFi connection and router reachability.");
         }
@@ -264,9 +316,10 @@ static void wifi_csi_watch_task(void *arg)
  */
 static esp_err_t csi_link_filter_init(void)
 {
+    csi_link_filter_t filter = {0};
     wifi_ap_record_t ap_info;
     ESP_RETURN_ON_ERROR(esp_wifi_sta_get_ap_info(&ap_info), TAG, "Get connected AP info failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_get_mac(WIFI_IF_STA, s_link_filter.sta_mac), TAG, "Get STA MAC failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_get_mac(WIFI_IF_STA, filter.sta_mac), TAG, "Get STA MAC failed");
 
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (netif == NULL) {
@@ -280,16 +333,36 @@ static esp_err_t csi_link_filter_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    memcpy(s_link_filter.ap_bssid, ap_info.bssid, sizeof(s_link_filter.ap_bssid));
-    s_link_filter.gateway_ip = ip_info.gw;
-    s_link_filter.ready = true;
+    memcpy(filter.ap_bssid, ap_info.bssid, sizeof(filter.ap_bssid));
+    filter.gateway_ip = ip_info.gw;
+    filter.ready = true;
+
+    portENTER_CRITICAL(&s_link_filter_lock);
+    s_link_filter = filter;
+    portEXIT_CRITICAL(&s_link_filter_lock);
 
     ESP_LOGI(TAG,
              "CSI filter ready: router/AP " MACSTR " -> ESP32-C5 " MACSTR ", gateway " IPSTR,
-             MAC2STR(s_link_filter.ap_bssid),
-             MAC2STR(s_link_filter.sta_mac),
-             IP2STR(&s_link_filter.gateway_ip));
+             MAC2STR(filter.ap_bssid),
+             MAC2STR(filter.sta_mac),
+             IP2STR(&filter.gateway_ip));
     return ESP_OK;
+}
+
+/**
+ * @brief 停止并释放内部 ping 会话。
+ *
+ * 调用方法：WiFi 断开或重新配置网关前调用。
+ */
+static void internal_ping_stop(void)
+{
+    if (s_internal_ping == NULL) {
+        return;
+    }
+
+    (void)esp_ping_stop(s_internal_ping);
+    (void)esp_ping_delete_session(s_internal_ping);
+    s_internal_ping = NULL;
 }
 
 /**
@@ -300,6 +373,8 @@ static esp_err_t csi_link_filter_init(void)
  */
 static esp_err_t internal_ping_start(void)
 {
+    internal_ping_stop();
+
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (netif == NULL) {
         ESP_LOGW(TAG, "Cannot start internal ping: WIFI_STA_DEF not found");
@@ -339,7 +414,85 @@ static esp_err_t internal_ping_start(void)
         return ret;
     }
 
+    s_internal_ping = ping;
     ESP_LOGI(TAG, "Internal ping started, target gateway: " IPSTR, IP2STR(&ip_info.gw));
+    return ESP_OK;
+}
+
+/**
+ * @brief WiFi 状态变化处理函数，用于暂停和恢复 CSI 串口输出。
+ *
+ * 调用方法：wifi_csi_monitor_start() 注册到 ESP-IDF 事件循环。
+ */
+static void csi_wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                   int32_t event_id, void *event_data)
+{
+    (void)arg;
+    (void)event_data;
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        internal_ping_stop();
+        csi_link_filter_mark_down();
+        (void)esp_wifi_set_csi(false);
+        (void)esp_wifi_set_promiscuous(false);
+        ESP_LOGW(TAG, "CSI paused until WiFi reconnects");
+        return;
+    }
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "WiFi reconnected, refreshing CSI link");
+
+        if (csi_link_filter_init() != ESP_OK) {
+            csi_link_filter_mark_down();
+            return;
+        }
+
+        esp_err_t ret = esp_wifi_set_promiscuous(true);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Re-enable promiscuous mode failed: %s", esp_err_to_name(ret));
+        }
+
+        ret = esp_wifi_set_csi(true);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Re-enable CSI failed: %s", esp_err_to_name(ret));
+        }
+
+        ret = internal_ping_start();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Restart internal ping failed: %s", esp_err_to_name(ret));
+        }
+    }
+}
+
+/**
+ * @brief 注册 CSI 需要的 WiFi/IP 事件处理函数。
+ */
+static esp_err_t csi_wifi_event_handler_register(void)
+{
+    if (s_csi_event_handler_registered) {
+        return ESP_OK;
+    }
+
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT,
+                                                   WIFI_EVENT_STA_DISCONNECTED,
+                                                   &csi_wifi_event_handler,
+                                                   NULL),
+                        TAG,
+                        "Register CSI WiFi disconnect event failed");
+
+    esp_err_t ret = esp_event_handler_register(IP_EVENT,
+                                               IP_EVENT_STA_GOT_IP,
+                                               &csi_wifi_event_handler,
+                                               NULL);
+    if (ret != ESP_OK) {
+        esp_event_handler_unregister(WIFI_EVENT,
+                                     WIFI_EVENT_STA_DISCONNECTED,
+                                     &csi_wifi_event_handler);
+        ESP_LOGW(TAG, "Register CSI WiFi reconnect event failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_csi_event_handler_registered = true;
     return ESP_OK;
 }
 
@@ -401,6 +554,7 @@ esp_err_t wifi_csi_monitor_start(void)
         return ESP_ERR_NO_MEM;
     }
 
+    ESP_RETURN_ON_ERROR(csi_wifi_event_handler_register(), TAG, "Register CSI WiFi event handler failed");
     ESP_RETURN_ON_ERROR(internal_ping_start(), TAG, "Start internal ping failed");
     ESP_LOGI(TAG, "ESP32-C5 RX CSI started");
     return ESP_OK;

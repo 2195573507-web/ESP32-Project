@@ -13,7 +13,7 @@ typedef enum {
     CSI_STATE_ACTIVE = 2,      // 轻微扰动，主要用于频段状态。
     CSI_STATE_MOTION = 3,      // 检测到明显运动。
     CSI_STATE_OFFSET = 4,      // 相对 baseline 偏移较大，但相邻帧变化较小。
-    CSI_STATE_GAIN_FREEZE = 5, // AGC/FFT gain 跳变，当前帧不适合判断。
+    CSI_STATE_RESERVED_5 = 5,   // 历史保留状态 ID，当前官方增益算法已移除，不再主动输出。
     CSI_STATE_DATA_FROZEN = 6, // CSI 数据疑似冻结。
     CSI_STATE_RECOVER = 7,     // baseline 正在恢复。
 } csi_state_t;

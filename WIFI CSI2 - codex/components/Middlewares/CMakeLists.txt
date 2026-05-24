@@ -4,7 +4,7 @@ set(srcs
             csi/csi_serial_output.c
             csi/csi_processor.c
             csi/csi_subband_analysis.c
-            csi/csi_gain_compensation.c)
+            csi/csi_espectre_like.c)
 
 set(include_dirs
             wifi
@@ -17,8 +17,7 @@ set(requires
             nvs_flash
             esp_timer
             log
-            lwip
-            espressif__esp_csi_gain_ctrl)
+            lwip)
 
 idf_component_register(SRCS ${srcs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})
 component_compile_options(-ffast-math -O3 -Wno-error=format -Wno-format)

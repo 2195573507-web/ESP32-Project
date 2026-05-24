@@ -69,16 +69,6 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.0.36
-  espressif/cmake_utilities:
-    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=4.1'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 0.5.3
   espressif/console_cmd_ping:
     component_hash: 831875b3b6a9983b34abab2ecba7ca83447600912eda4b126948e1e439cf4a11
     dependencies:
@@ -103,28 +93,6 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.1.0
-  espressif/esp_csi_gain_ctrl:
-    component_hash: 2700b6625343916dfb721af42131857b3e387dbbb9cc1df569128525c8b05f8e
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.*
-    - name: idf
-      require: private
-      version: '>=4.4.1'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32
-    - esp32s3
-    - esp32s2
-    - esp32c3
-    - esp32c5
-    - esp32c6
-    - esp32c61
-    version: 0.1.5
   idf:
     source:
       type: idf
@@ -132,8 +100,7 @@ dependencies:
 direct_dependencies:
 - espp/ping
 - espressif/console_cmd_ping
-- espressif/esp_csi_gain_ctrl
 - idf
-manifest_hash: 9618294d3c6fc3f158f4b3e081d4ada647321d4757bc9670d4b379614e9f230d
+manifest_hash: d80dbff54ffb17de8080a2d025bdf13f4bd3d8d5340528aff4e524526285d373
 target: esp32c5
 version: 2.0.0

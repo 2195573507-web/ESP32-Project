@@ -14,12 +14,15 @@
 esp_err_t wifi_manager_init(void);
 
 /**
- * @brief 连接到已保存列表里信号最强的 Wi-Fi AP
+ * @brief 持续扫描并连接到已保存列表里信号最强的 Wi-Fi AP
  *
- * 本函数会先扫描周围 AP，再从 wifi_credentials.h 的 WIFI_KNOWN_LIST
- * 中选择 RSSI 最大的一项连接。新增 WiFi 名和密码时，只需要在
- * WIFI_KNOWN_LIST 里新增 {"WiFi名", "WiFi密码"}。
- * @return 成功返回 ESP_OK，失败返回对应错误码。
+ * 本函数会启动后台重连任务，并阻塞等待首次连接成功。后台任务会持续扫描
+ * 周围 AP，从 wifi_credentials.h 的 WIFI_KNOWN_LIST 中选择 RSSI 最大的一项
+ * 连接；如果暂时没有可用 WiFi，会间隔重扫直到连接成功。运行中发生断线时，
+ * 后台任务也会重新扫描并自动连接当前可用的已知 WiFi。
+ * 新增 WiFi 名和密码时，只需要在 WIFI_KNOWN_LIST 里新增
+ * {"WiFi名", "WiFi密码"}。
+ * @return 首次连接成功返回 ESP_OK；初始化状态异常或任务创建失败时返回错误码。
  */
 esp_err_t wifi_connect_to_ap(void);
 

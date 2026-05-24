@@ -4,7 +4,6 @@
 #include <stdint.h>
 
 #include "csi_print_config.h"
-#include "csi_gain_compensation.h"
 #include "csi_monitor.h"
 #include "csi_processor.h"
 #include "esp_netif.h"
@@ -21,7 +20,6 @@ typedef struct {
     uint8_t channel;                   // 当前 WiFi 信道。
     uint16_t csi_len;                  // ESP-IDF 回调给出的原始 CSI 字节长度。
     csi_processor_result_t raw_processed; // 原始 CSI 主算法输出的运动特征。
-    csi_gain_compensation_result_t gain;  // 官方增益补偿状态。
     uint16_t raw_len;                  // 实际缓存/输出的原始 CSI 字节长度。
     uint8_t mac[6];                    // 源 MAC，期望为 AP/路由器 BSSID。
     uint8_t dmac[6];                   // 目的 MAC，期望为本机 STA MAC。

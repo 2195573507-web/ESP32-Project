@@ -23,8 +23,8 @@ void app_main(void)
     // 初始化 WiFi 管理器：内部完成 NVS、网络接口、事件循环和 STA 模式初始化。
     ESP_ERROR_CHECK(wifi_manager_init());
 
-    // 连接已保存列表中当前信号最强的 WiFi。
-    ESP_LOGI(TAG, "WiFi connect start");
+    // 持续扫描并连接已保存列表中当前可用且信号最强的 WiFi。
+    ESP_LOGI(TAG, "WiFi connect task start");
     if (wifi_connect_to_ap() != ESP_OK) {
         ESP_LOGE(TAG, "WiFi connect failed");
         while (1) {

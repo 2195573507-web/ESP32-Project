@@ -20,7 +20,7 @@ CSI_STATE_TEXT = {
     2: "active",
     3: "motion",
     4: "offset",
-    5: "gain_freeze",
+    5: "reserved_5",
     6: "data_frozen",
     7: "recover",
 }
@@ -87,10 +87,6 @@ class CsiFeature:
     motion_state: str
     decision_state_id: int
     decision_state_text: str
-    agc_gain: int = 0
-    fft_gain: int = 0
-    compensate_gain: float = 1.0
-    gain_compensated: bool = False
     decision_mode: int = 0
     global_norm_score: float = 0.0
     global_state_id: int = 0
@@ -101,6 +97,15 @@ class CsiFeature:
     decision_score: float = 0.0
     subband_count: int = 0
     best_band: int = -1
+    espectre_score: float = 0.0
+    espectre_state_id: int = 0
+    espectre_calibrating: bool = True
+    espectre_selected_count: int = 0
+    espectre_best_index: int = -1
+    espectre_turbulence: float = 0.0
+    espectre_mvs: float = 0.0
+    espectre_threshold: float = 0.0
+    espectre_nbvi: float = 0.0
     band0_score: float = 0.0
     band1_score: float = 0.0
     band2_score: float = 0.0
@@ -131,18 +136,7 @@ def parse_csi_feature(line: str) -> CsiFeature | None:
         return None
 
     try:
-        if len(parts) >= 20:
-            agc_gain = int(parts[15])
-            fft_gain = int(parts[16])
-            compensate_gain = float(parts[17])
-            gain_compensated = parts[18].strip() == "1"
-            decision_state_id = parse_state_id(parts[19].strip())
-        else:
-            agc_gain = 0
-            fft_gain = 0
-            compensate_gain = 1.0
-            gain_compensated = False
-            decision_state_id = parse_state_id(parts[15].strip())
+        decision_state_id = parse_state_id(parts[15].strip())
         decision_state_text = state_text_from_id(decision_state_id)
 
         decision_mode = 0
@@ -155,23 +149,41 @@ def parse_csi_feature(line: str) -> CsiFeature | None:
         decision_score = 0.0
         subband_count = 0
         best_band = -1
+        espectre_score = 0.0
+        espectre_state_id = 0
+        espectre_calibrating = True
+        espectre_selected_count = 0
+        espectre_best_index = -1
+        espectre_turbulence = 0.0
+        espectre_mvs = 0.0
+        espectre_threshold = 0.0
+        espectre_nbvi = 0.0
         band_scores = [0.0, 0.0, 0.0, 0.0]
         band_states = [0, 0, 0, 0]
 
-        if len(parts) >= 47:
-            decision_mode = int(parts[20])
-            global_norm_score = float(parts[21])
-            global_state_id = parse_state_id(parts[22])
-            subband_norm_score = float(parts[23])
-            subband_state_id = parse_state_id(parts[24])
-            fusion_score = float(parts[25])
-            fusion_state_id = parse_state_id(parts[26])
-            decision_score = float(parts[27])
-            decision_state_id = parse_state_id(parts[28])
+        if len(parts) >= 52:
+            decision_mode = int(parts[16])
+            global_norm_score = float(parts[17])
+            global_state_id = parse_state_id(parts[18])
+            subband_norm_score = float(parts[19])
+            subband_state_id = parse_state_id(parts[20])
+            fusion_score = float(parts[21])
+            fusion_state_id = parse_state_id(parts[22])
+            decision_score = float(parts[23])
+            decision_state_id = parse_state_id(parts[24])
             decision_state_text = state_text_from_id(decision_state_id)
-            subband_count = int(parts[29])
-            best_band = int(parts[30])
-            index = 31
+            subband_count = int(parts[25])
+            best_band = int(parts[26])
+            espectre_score = float(parts[27])
+            espectre_state_id = parse_state_id(parts[28])
+            espectre_calibrating = parts[29].strip() == "1"
+            espectre_selected_count = int(parts[30])
+            espectre_best_index = int(parts[31])
+            espectre_turbulence = float(parts[32])
+            espectre_mvs = float(parts[33])
+            espectre_threshold = float(parts[34])
+            espectre_nbvi = float(parts[35])
+            index = 36
             for band_index in range(4):
                 band_scores[band_index] = float(parts[index + 2])
                 band_states[band_index] = parse_state_id(parts[index + 3])
@@ -195,10 +207,6 @@ def parse_csi_feature(line: str) -> CsiFeature | None:
             motion_state=decision_state_text,
             decision_state_id=decision_state_id,
             decision_state_text=decision_state_text,
-            agc_gain=agc_gain,
-            fft_gain=fft_gain,
-            compensate_gain=compensate_gain,
-            gain_compensated=gain_compensated,
             decision_mode=decision_mode,
             global_norm_score=global_norm_score,
             global_state_id=global_state_id,
@@ -209,6 +217,15 @@ def parse_csi_feature(line: str) -> CsiFeature | None:
             decision_score=decision_score,
             subband_count=subband_count,
             best_band=best_band,
+            espectre_score=espectre_score,
+            espectre_state_id=espectre_state_id,
+            espectre_calibrating=espectre_calibrating,
+            espectre_selected_count=espectre_selected_count,
+            espectre_best_index=espectre_best_index,
+            espectre_turbulence=espectre_turbulence,
+            espectre_mvs=espectre_mvs,
+            espectre_threshold=espectre_threshold,
+            espectre_nbvi=espectre_nbvi,
             band0_score=band_scores[0],
             band1_score=band_scores[1],
             band2_score=band_scores[2],
@@ -295,10 +312,6 @@ def append_csv(csv_writer: csv.writer, feature: CsiFeature) -> None:
         feature.smooth_motion_score,
         feature.window_score,
         feature.freeze_count,
-        feature.agc_gain,
-        feature.fft_gain,
-        feature.compensate_gain,
-        int(feature.gain_compensated),
         feature.motion_state,
         feature.decision_state_id,
         feature.decision_state_text,
@@ -313,6 +326,15 @@ def append_csv(csv_writer: csv.writer, feature: CsiFeature) -> None:
         feature.global_norm_score,
         feature.subband_norm_score,
         feature.fusion_score,
+        feature.espectre_score,
+        feature.espectre_state_id,
+        int(feature.espectre_calibrating),
+        feature.espectre_selected_count,
+        feature.espectre_best_index,
+        feature.espectre_turbulence,
+        feature.espectre_mvs,
+        feature.espectre_threshold,
+        feature.espectre_nbvi,
         feature.band0_score,
         feature.band1_score,
         feature.band2_score,
@@ -452,10 +474,6 @@ def run_plot(args: argparse.Namespace) -> None:
                 "smooth_motion_score",
                 "window_score",
                 "freeze_count",
-                "agc_gain",
-                "fft_gain",
-                "compensate_gain",
-                "gain_compensated",
                 "motion_state",
                 "decision_state_id",
                 "decision_state_text",
@@ -470,6 +488,15 @@ def run_plot(args: argparse.Namespace) -> None:
                 "global_norm_score",
                 "subband_norm_score",
                 "fusion_score",
+                "espectre_score",
+                "espectre_state_id",
+                "espectre_calibrating",
+                "espectre_selected_count",
+                "espectre_best_index",
+                "espectre_turbulence",
+                "espectre_mvs",
+                "espectre_threshold",
+                "espectre_nbvi",
                 "band0_score",
                 "band1_score",
                 "band2_score",
@@ -640,7 +667,7 @@ def run_plot(args: argparse.Namespace) -> None:
             draw_metric_card(ax_header, 0.33, 0.18, 0.13, 0.56, "Frame", "--", "#7dd3fc")
             draw_metric_card(ax_header, 0.48, 0.18, 0.13, 0.56, "State", "waiting", "#fda4af")
             draw_metric_card(ax_header, 0.63, 0.18, 0.13, 0.56, "RSSI", "--", "#86efac")
-            draw_metric_card(ax_header, 0.78, 0.18, 0.17, 0.56, "Gain", "x1.000", "#c4b5fd")
+            draw_metric_card(ax_header, 0.78, 0.18, 0.17, 0.56, "ESPectre", "cal", "#c4b5fd")
             header_dynamic_artists.extend(ax_header.patches[count_before[0]:])
             header_dynamic_artists.extend(ax_header.texts[count_before[1]:])
             return line_delta, line_base, line_score, line_smooth, line_window, line_band0, line_band1, line_band2, line_band3, line_rssi, status_text
@@ -673,8 +700,8 @@ def run_plot(args: argparse.Namespace) -> None:
         draw_metric_card(ax_header, 0.33, 0.18, 0.13, 0.56, "Frame", str(frames[-1]), "#7dd3fc")
         draw_metric_card(ax_header, 0.48, 0.18, 0.13, 0.56, "State", latest_state, state_color)
         draw_metric_card(ax_header, 0.63, 0.18, 0.13, 0.56, "RSSI", f"{rssi[-1]} dBm", "#86efac")
-        gain_value = f"x{last_feature.compensate_gain:.3f}" if last_feature is not None else "x1.000"
-        draw_metric_card(ax_header, 0.78, 0.18, 0.17, 0.56, "Gain", gain_value, "#c4b5fd")
+        espectre_value = "cal" if last_feature is None or last_feature.espectre_calibrating else f"{last_feature.espectre_score:.3f}"
+        draw_metric_card(ax_header, 0.78, 0.18, 0.17, 0.56, "ESPectre", espectre_value, "#c4b5fd")
         header_dynamic_artists.extend(ax_header.patches[count_before[0]:])
         header_dynamic_artists.extend(ax_header.texts[count_before[1]:])
 

@@ -17,13 +17,17 @@ static const char *TAG = "wifi_manager";
 
 /* FreeRTOS 事件组：用于标记 Wi-Fi 是否已经连接。 */
 static EventGroupHandle_t s_wifi_event_group;
+static TaskHandle_t s_wifi_reconnect_task_handle = NULL;
 
-/* 事件组位：连接成功和连接失败分别占用一个 bit。 */
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
+/* 事件组位：连接状态、重连请求和本轮连接断开分别占用一个 bit。 */
+#define WIFI_CONNECTED_BIT    BIT0
+#define WIFI_RECONNECT_BIT    BIT1
+#define WIFI_DISCONNECTED_BIT BIT2
 
-static int s_retry_num = 0;
-static const int MAX_RETRY = 5;
+#define WIFI_RESCAN_DELAY_MS          3000
+#define WIFI_CONNECT_TIMEOUT_MS       15000
+#define WIFI_RECONNECT_TASK_STACK     4096
+#define WIFI_RECONNECT_TASK_PRIORITY  5
 
 /**
  * @brief 在已知 WiFi 列表中按 SSID 查找账号。
@@ -119,6 +123,115 @@ static esp_err_t scan_strongest_known_wifi(const known_wifi_t **selected_wifi, i
 }
 
 /**
+ * @brief 根据选中的已知 WiFi 配置 STA 并发起连接。
+ *
+ * 调用方法：wifi_reconnect_task() 每次扫描到可用账号后调用。
+ * @param selected_wifi 扫描后选中的已知 WiFi 账号。
+ * @param selected_rssi 扫描到的 RSSI，仅用于日志输出。
+ * @return 成功发起连接返回 ESP_OK，否则返回 ESP-IDF 错误码。
+ */
+static esp_err_t connect_selected_wifi(const known_wifi_t *selected_wifi, int8_t selected_rssi)
+{
+    wifi_config_t wifi_config = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
+        },
+    };
+
+    // 复制扫描后选中的 WiFi 名和密码，确保末尾以 NUL 结束。
+    strlcpy((char *)wifi_config.sta.ssid, selected_wifi->ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, selected_wifi->password, sizeof(wifi_config.sta.password));
+
+    esp_err_t ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Set Wi-Fi config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_DISCONNECTED_BIT);
+
+    ESP_LOGI(TAG, "Connecting to SSID: %s, RSSI: %d", selected_wifi->ssid, selected_rssi);
+
+    ret = esp_wifi_connect();
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
+        ESP_LOGE(TAG, "Start Wi-Fi connect failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+/**
+ * @brief WiFi 重连任务。
+ *
+ * 调用方法：wifi_connect_to_ap() 首次调用时创建。
+ * 任务被 WIFI_RECONNECT_BIT 唤醒后会持续扫描已知 WiFi，直到连接成功；
+ * 后续只要收到断线事件，事件处理函数会再次唤醒本任务重新扫描和连接。
+ */
+static void wifi_reconnect_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        xEventGroupWaitBits(s_wifi_event_group,
+                            WIFI_RECONNECT_BIT,
+                            pdTRUE,
+                            pdFALSE,
+                            portMAX_DELAY);
+
+        while (!wifi_is_connected()) {
+            const known_wifi_t *selected_wifi = NULL;
+            int8_t selected_rssi = 0;
+
+            xEventGroupClearBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT);
+
+            esp_err_t ret = scan_strongest_known_wifi(&selected_wifi, &selected_rssi);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "No connectable known Wi-Fi yet, rescan in %d ms",
+                         WIFI_RESCAN_DELAY_MS);
+                vTaskDelay(pdMS_TO_TICKS(WIFI_RESCAN_DELAY_MS));
+                continue;
+            }
+
+            ret = connect_selected_wifi(selected_wifi, selected_rssi);
+            if (ret != ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(WIFI_RESCAN_DELAY_MS));
+                continue;
+            }
+
+            EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                                   WIFI_CONNECTED_BIT | WIFI_DISCONNECTED_BIT,
+                                                   pdFALSE,
+                                                   pdFALSE,
+                                                   pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+
+            if (bits & WIFI_CONNECTED_BIT) {
+                ESP_LOGI(TAG, "Wi-Fi connected");
+                break;
+            }
+
+            if (bits & WIFI_DISCONNECTED_BIT) {
+                ESP_LOGW(TAG,
+                         "Wi-Fi connection attempt failed, rescan in %d ms",
+                         WIFI_RESCAN_DELAY_MS);
+            } else {
+                ESP_LOGW(TAG,
+                         "Wi-Fi connection timeout, rescan in %d ms",
+                         WIFI_RESCAN_DELAY_MS);
+                esp_wifi_disconnect();
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RESCAN_DELAY_MS));
+        }
+    }
+}
+
+/**
  * @brief 事件处理函数
  *
  * 处理Wi-Fi和IP事件。
@@ -134,19 +247,19 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG, "Wi-Fi STA started");
+        xEventGroupSetBits(s_wifi_event_group, WIFI_RECONNECT_BIT);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < MAX_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "Retry to connect to the AP, attempt %d", s_retry_num);
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            ESP_LOGI(TAG, "Failed to connect to the AP");
-        }
+        const wifi_event_sta_disconnected_t *disconnected =
+            (const wifi_event_sta_disconnected_t *)event_data;
+        int reason = disconnected != NULL ? disconnected->reason : -1;
+
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        xEventGroupSetBits(s_wifi_event_group, WIFI_RECONNECT_BIT | WIFI_DISCONNECTED_BIT);
+        ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d, rescan scheduled", reason);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_RECONNECT_BIT | WIFI_DISCONNECTED_BIT);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -183,6 +296,10 @@ esp_err_t wifi_manager_init(void)
 
     // 创建事件组
     s_wifi_event_group = xEventGroupCreate();
+    if (s_wifi_event_group == NULL) {
+        ESP_LOGE(TAG, "Create Wi-Fi event group failed");
+        return ESP_ERR_NO_MEM;
+    }
 
     // 注册事件处理函数
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
@@ -194,7 +311,7 @@ esp_err_t wifi_manager_init(void)
     // 启动Wi-Fi
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // 关闭 WiFi 省电，CSI 采集需要持续接收无线帧，省电模式可能导致长时间没有数据。
+    // 关闭 WiFi 省电，保持 STA 持续接收无线帧，避免长时间无数据。
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     ESP_LOGI(TAG, "Wi-Fi manager initialized");
@@ -210,57 +327,35 @@ esp_err_t wifi_manager_init(void)
  */
 esp_err_t wifi_connect_to_ap(void)
 {
-    const known_wifi_t *selected_wifi = NULL;
-    int8_t selected_rssi = 0;
-
-    esp_err_t ret = scan_strongest_known_wifi(&selected_wifi, &selected_rssi);
-    if (ret != ESP_OK) {
-        return ret;
+    if (s_wifi_event_group == NULL) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            .pmf_cfg = {
-                .capable = true,
-                .required = false
-            },
-        },
-    };
-
-    // 复制扫描后选中的 WiFi 名和密码，确保末尾以 NUL 结束。
-    strlcpy((char *)wifi_config.sta.ssid, selected_wifi->ssid, sizeof(wifi_config.sta.ssid));
-    strlcpy((char *)wifi_config.sta.password, selected_wifi->password, sizeof(wifi_config.sta.password));
-
-    // 连接前清除上一次连接留下的状态位，避免误判连接结果。
-    s_retry_num = 0;
-    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-
-    // 设置 WiFi 配置。
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
-    ESP_LOGI(TAG, "Connecting to SSID: %s, RSSI: %d", selected_wifi->ssid, selected_rssi);
-
-    // 连接到扫描结果中信号最强的已知 WiFi。
-    esp_wifi_connect();
-
-    // 等待连接结果
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
-
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Connected to AP");
-        return ESP_OK;
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(TAG, "Failed to connect to AP");
-        return ESP_FAIL;
-    } else {
-        ESP_LOGE(TAG, "Unexpected event");
-        return ESP_FAIL;
+    if (s_wifi_reconnect_task_handle == NULL) {
+        BaseType_t task_created = xTaskCreate(wifi_reconnect_task,
+                                             "wifi_reconnect",
+                                             WIFI_RECONNECT_TASK_STACK,
+                                             NULL,
+                                             WIFI_RECONNECT_TASK_PRIORITY,
+                                             &s_wifi_reconnect_task_handle);
+        if (task_created != pdPASS) {
+            s_wifi_reconnect_task_handle = NULL;
+            ESP_LOGE(TAG, "Create Wi-Fi reconnect task failed");
+            return ESP_ERR_NO_MEM;
+        }
     }
+
+    // 首次调用时主动触发扫描；后续断线由事件处理函数自动触发。
+    xEventGroupSetBits(s_wifi_event_group, WIFI_RECONNECT_BIT);
+    ESP_LOGI(TAG, "Waiting for Wi-Fi connection");
+
+    xEventGroupWaitBits(s_wifi_event_group,
+                        WIFI_CONNECTED_BIT,
+                        pdFALSE,
+                        pdTRUE,
+                        portMAX_DELAY);
+
+    return ESP_OK;
 }
 
 /**

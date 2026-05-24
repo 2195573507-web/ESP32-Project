@@ -1,6 +1,7 @@
 #include "csi_serial_output.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,18 +22,22 @@ typedef struct {
 static csi_serial_output_ctx_t s_serial_output = {0};
 
 /**
- * @brief 把 CSI 处理状态转换为串口文本。
+ * @brief 判断两个 CSI 链路信息是否完全相同。
  *
- * 调用方法：csi_print_feature_line() 输出 CSI_FEATURE_RAW 时调用。
- * 优先显示冻结保护状态，其次显示运动状态机结果。
- * @param processed 单帧 CSI 处理结果。
- * @return 状态文本：gain_freeze/data_frozen/motion/recover/static/unknown。
+ * 调用方法：串口输出任务检测 WiFi 重连后链路是否变化。
  */
+static bool csi_link_info_equal(const csi_link_info_t *a, const csi_link_info_t *b)
+{
+    return memcmp(a->ap_bssid, b->ap_bssid, sizeof(a->ap_bssid)) == 0 &&
+           memcmp(a->sta_mac, b->sta_mac, sizeof(a->sta_mac)) == 0 &&
+           a->gateway_ip.addr == b->gateway_ip.addr;
+}
+
 /**
  * @brief 输出一行 CSI_FEATURE_RAW。
  *
  * 调用方法：wifi_csi_serial_output_task() 每收到新帧后调用一次。
- * 这一行给网页绘图使用，包含 RSSI、CSI 特征、增益状态和 motion_state。
+ * 这一行给网页绘图使用，包含 RSSI、CSI 特征和三套独立算法结果。
  * @param label 串口行标签，当前固定为 CSI_FEATURE_RAW。
  * @param feature 单帧 CSI 特征快照。
  * @param processed feature 中的 RAW 主算法处理结果。
@@ -41,19 +46,13 @@ static void csi_print_feature_line(const char *label,
                                    const csi_feature_t *feature,
                                    const csi_processor_result_t *processed)
 {
-    /*
-     * CSI_FEATURE_RAW 兼容规则：
-     * 前 20 个字段不插入新字段，只把第 20 字段从旧 motion_state 字符串改为 decision_state_id 整数。
-     * 状态统一使用整数 ID，网页/Python/LCD 再负责映射成文字。
-     * CSI_ENABLE_SUBBAND_ANALYSIS=1 且 CSI_PRINT_SUBBAND_DATA=1 时追加扩展字段，总字段数为 47。
-     */
-    printf("%s,%lu,%d,%u,%u,%u,%.2f,%.2f,%.4f,%.4f,%.2f,%.4f,%.4f,%.4f,%u,%u,%d,%.4f,%u,%u",
+    printf("%s,%lu,%d,%u,%u,%u,%.2f,%.2f,%.4f,%.4f,%.2f,%.4f,%.4f,%.4f,%u,%u",
            label,
            (unsigned long)feature->frame_count,
            feature->rssi,
-           feature->channel,
-           feature->csi_len,
-           processed->valid_points,
+           (unsigned)feature->channel,
+           (unsigned)feature->csi_len,
+           (unsigned)processed->valid_points,
            processed->mean_amp,
            processed->var_amp,
            processed->delta_norm,
@@ -62,14 +61,10 @@ static void csi_print_feature_line(const char *label,
            processed->motion_score,
            processed->smooth_motion_score,
            processed->window_motion_score,
-           processed->freeze_count,
-           feature->gain.agc_gain,
-           feature->gain.fft_gain,
-           feature->gain.compensate_gain,
-           feature->gain.compensated ? 1U : 0U,
+           (unsigned)processed->freeze_count,
            (unsigned)processed->decision_state_id);
 #if CSI_ENABLE_SUBBAND_ANALYSIS && CSI_PRINT_SUBBAND_DATA
-    printf(",%u,%.4f,%u,%.4f,%u,%.4f,%u,%.4f,%u,%u,%d",
+    printf(",%u,%.4f,%u,%.4f,%u,%.4f,%u,%.4f,%u,%u,%d,%.4f,%u,%u,%u,%d,%.4f,%.4f,%.4f,%.4f",
            processed->decision_mode,
            processed->global_norm_score,
            (unsigned)processed->global_state_id,
@@ -79,8 +74,17 @@ static void csi_print_feature_line(const char *label,
            (unsigned)processed->fusion_state_id,
            processed->decision_score,
            (unsigned)processed->decision_state_id,
-           processed->subband.subband_count,
-           processed->subband.best_band);
+           (unsigned)processed->subband.subband_count,
+           processed->subband.best_band,
+           processed->espectre.motion_score,
+           (unsigned)processed->espectre.state,
+           processed->espectre.calibrating ? 1U : 0U,
+           (unsigned)processed->espectre.selected_count,
+           processed->espectre.best_index,
+           processed->espectre.turbulence,
+           processed->espectre.mvs_score,
+           processed->espectre.threshold,
+           processed->espectre.nbvi_score);
     for (uint8_t i = 0; i < CSI_SUBBAND_COUNT; i++) {
         const csi_subband_result_t *band = &processed->subband.bands[i];
         printf(",%.4f,%.4f,%.4f,%u",
@@ -97,22 +101,21 @@ static void csi_print_feature_line(const char *label,
  * @brief 输出一行 CSI_DBG。
  *
  * 调用方法：wifi_csi_serial_output_task() 每收到新帧后调用一次。
- * 这一行主要用于观察 AGC/FFT/compensate_gain 和运动评分之间的关系。
+ * 这一行主要用于观察三套算法核心评分之间的关系。
  * @param feature 单帧 CSI 特征快照。
  */
 static void csi_print_debug_line(const csi_feature_t *feature)
 {
     const csi_processor_result_t *processed = &feature->raw_processed;
 
-    printf("CSI_DBG,%lu,%u,%d,%.3f,%.5f,%.5f,%.5f,%.5f\n",
+    printf("CSI_DBG,%lu,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\n",
            (unsigned long)feature->frame_count,
-           feature->gain.agc_gain,
-           feature->gain.fft_gain,
-           feature->gain.compensate_gain,
            processed->delta_norm,
            processed->motion_score,
            processed->baseline_delta,
-           processed->amp_motion_score);
+           processed->subband_norm_score,
+           processed->espectre.motion_score,
+           processed->espectre.turbulence);
 }
 
 /**
@@ -143,7 +146,7 @@ static void csi_print_headers(const csi_link_info_t *link_info)
            link_info->sta_mac[4],
            link_info->sta_mac[5],
            IP2STR(&link_info->gateway_ip));
-    printf("CSI_PROCESS_METHOD,raw_data=ESP32-C5 RX CSI I/Q int8 byte stream used locally,raw_uart=%s,gain_ctrl=official_gain_used_as_freeze_only,no_int8_compensated_csi,feature_data=amp=sqrt(i*i+q*q),norm_amp=amp/mean_amp,delta_norm=mean_abs(norm_now-norm_last),baseline_delta=mean_abs(norm_now-static_baseline),baseline_delta_smoothing=off,instant=0.70*delta_norm+0.30*baseline_delta_change,activity=0.65*instant+0.35*smooth_motion,motion_score=0.82*activity+0.18*baseline_delta,state=numeric_id,subband_analysis=%s,decision_mode=%s,band_state=esp32c5_local_numeric_id,recover=baseline_adaptive_recovery,no_boot_calibration,baseline_update=blocked_by_update_blocked_or_fast_when_stable_offset,gain_freeze=agc_or_fft_large_jump_freezes_state_and_baseline_for_3_frames,compensate_gain_does_not_trigger_motion_score,feature_lines=CSI_FEATURE_RAW,each_frame=%s\n",
+    printf("CSI_PROCESS_METHOD,raw_data=ESP32-C5 RX CSI I/Q int8 byte stream used locally,raw_uart=%s,gain_ctrl=removed,feature_data=amp=sqrt(i*i+q*q),norm_amp=amp/mean_amp,global_norm=delta_norm_plus_static_baseline_fsm,subband_norm=4_independent_frequency_bands,espectre_like=nbvi_selected_subcarriers_plus_turbulence_mvs,state=numeric_id,subband_analysis=%s,decision_mode=%s,band_state=esp32c5_local_numeric_id,recover=baseline_adaptive_recovery,no_official_gain_algorithm,feature_lines=CSI_FEATURE_RAW,each_frame=%s\n",
            CSI_PRINT_RAW_DATA ? "on" : "off",
            CSI_ENABLE_SUBBAND_ANALYSIS ? "on" : "off",
            CSI_DECISION_MODE == CSI_DECISION_SUBBAND_NORM ? "subband" :
@@ -154,11 +157,11 @@ static void csi_print_headers(const csi_link_info_t *link_info)
     printf("CSI_DATA_HEADER,type,frame,src_mac,dst_mac,link,rssi,rate,sig_mode,mcs,cwb,channel,len,first_word_invalid,data\n");
 #endif
 #if CSI_ENABLE_SUBBAND_ANALYSIS && CSI_PRINT_SUBBAND_DATA
-    printf("CSI_FEATURE_RAW_HEADER,type,frame,rssi,channel,csi_len,valid_points,mean_amp,var_amp,delta_norm,baseline_delta,smooth_mean_amp,motion_score,smooth_motion_score,window_score,freeze_count,agc_gain,fft_gain,compensate_gain,gain_compensated,decision_state_id,decision_mode,global_norm_score,global_state_id,subband_norm_score,subband_state_id,fusion_score,fusion_state_id,decision_score,decision_state_id,subband_count,best_band,band0_delta,band0_base,band0_score,band0_state_id,band1_delta,band1_base,band1_score,band1_state_id,band2_delta,band2_base,band2_score,band2_state_id,band3_delta,band3_base,band3_score,band3_state_id\n");
+    printf("CSI_FEATURE_RAW_HEADER,type,frame,rssi,channel,csi_len,valid_points,mean_amp,var_amp,delta_norm,baseline_delta,smooth_mean_amp,motion_score,smooth_motion_score,window_score,freeze_count,decision_state_id,decision_mode,global_norm_score,global_state_id,subband_norm_score,subband_state_id,fusion_score,fusion_state_id,decision_score,decision_state_id,subband_count,best_band,espectre_score,espectre_state_id,espectre_calibrating,espectre_selected_count,espectre_best_index,espectre_turbulence,espectre_mvs,espectre_threshold,espectre_nbvi,band0_delta,band0_base,band0_score,band0_state_id,band1_delta,band1_base,band1_score,band1_state_id,band2_delta,band2_base,band2_score,band2_state_id,band3_delta,band3_base,band3_score,band3_state_id\n");
 #else
-    printf("CSI_FEATURE_RAW_HEADER,type,frame,rssi,channel,csi_len,valid_points,mean_amp,var_amp,delta_norm,baseline_delta,smooth_mean_amp,motion_score,smooth_motion_score,window_score,freeze_count,agc_gain,fft_gain,compensate_gain,gain_compensated,decision_state_id\n");
+    printf("CSI_FEATURE_RAW_HEADER,type,frame,rssi,channel,csi_len,valid_points,mean_amp,var_amp,delta_norm,baseline_delta,smooth_mean_amp,motion_score,smooth_motion_score,window_score,freeze_count,decision_state_id\n");
 #endif
-    printf("CSI_DBG_HEADER,type,frame,agc_gain,fft_gain,compensate_gain,delta_norm,motion_score,baseline_delta,amp_motion\n");
+    printf("CSI_DBG_HEADER,type,frame,delta_norm,global_score,baseline_delta,subband_score,espectre_score,espectre_turbulence\n");
 }
 
 /**
@@ -174,25 +177,38 @@ static void wifi_csi_serial_output_task(void *arg)
 
     uint32_t last_printed_count = 0;
     csi_link_info_t link_info = {0};
+    bool link_info_ready = false;
 
     if (s_serial_output.link_info_fn != NULL &&
         s_serial_output.link_info_fn(&link_info, s_serial_output.ctx)) {
         csi_print_headers(&link_info);
+        link_info_ready = true;
     }
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(CSI_FEATURE_PRINT_INTERVAL_MS));
 
         csi_feature_t feature;
+        csi_link_info_t current_link_info = {0};
         uint32_t current_count;
 
         if (s_serial_output.snapshot_fn == NULL ||
             !s_serial_output.snapshot_fn(&feature, &current_count, s_serial_output.ctx)) {
+            link_info_ready = false;
+            last_printed_count = 0;
             continue;
         }
 
         if (current_count == 0 || current_count == last_printed_count) {
             continue;
+        }
+
+        if (s_serial_output.link_info_fn != NULL &&
+            s_serial_output.link_info_fn(&current_link_info, s_serial_output.ctx) &&
+            (!link_info_ready || !csi_link_info_equal(&link_info, &current_link_info))) {
+            link_info = current_link_info;
+            csi_print_headers(&link_info);
+            link_info_ready = true;
         }
 
         last_printed_count = current_count;
@@ -213,14 +229,14 @@ static void wifi_csi_serial_output_task(void *arg)
                feature.dmac[3],
                feature.dmac[4],
                feature.dmac[5],
-               feature.rssi,
-               0U,
-               feature.sig_mode,
-               feature.mcs,
-               feature.cwb,
-               feature.channel,
-               feature.raw_len,
-               feature.first_word_invalid);
+           feature.rssi,
+           0U,
+               (unsigned)feature.sig_mode,
+               (unsigned)feature.mcs,
+               (unsigned)feature.cwb,
+               (unsigned)feature.channel,
+               (unsigned)feature.raw_len,
+               (unsigned)feature.first_word_invalid);
 
         for (uint16_t i = 0; i < feature.raw_len; i++) {
             printf("%s%d", i == 0 ? "" : " ", feature.raw_buf[i]);
