@@ -26,6 +26,9 @@ typedef struct {
  */
 static const known_wifi_t WIFI_KNOWN_LIST[] = {
     {"REPLACE_WITH_WIFI_SSID", "REPLACE_WITH_WIFI_PASSWORD"},
+    {"LAPTOP-G5CAQHC0 3630","hjh123456"},
+    {"AAABBB","0123456789"},
+    {"iPhoneWang", "Wlsz060501"}
     //{"EXAMPLE_WIFI_SSID_2", "EXAMPLE_WIFI_PASSWORD_2"}
 };
 
