@@ -384,12 +384,18 @@ def serial_loop(args: argparse.Namespace, state: PlotState, stop_event: threadin
                 state.set_status("waiting for CSI_FEATURE_RAW frames", port)
                 serial_line_count = 0
                 feature_count = 0
+                last_rx_time = time.monotonic()
                 while not stop_event.is_set():
                     raw_line = ser.readline()
                     if not raw_line:
+                        idle_seconds = time.monotonic() - last_rx_time
+                        if serial_line_count > 0 and idle_seconds >= args.serial_idle_reopen:
+                            state.set_status("serial idle after reset, reopening port", port)
+                            break
                         continue
 
                     serial_line_count += 1
+                    last_rx_time = time.monotonic()
                     line = raw_line.decode("utf-8", errors="ignore").strip()
                     link = parse_csi_link(line)
                     if link is not None:
@@ -481,7 +487,7 @@ HTML = r"""<!doctype html>
     .header-right {
       min-width: 0;
       display: grid;
-      grid-template-columns: minmax(150px, 0.75fr) minmax(200px, 1fr) minmax(220px, 1fr) 92px minmax(210px, 0.9fr);
+      grid-template-columns: minmax(150px, 0.75fr) minmax(200px, 1fr) minmax(220px, 1fr) 92px 92px minmax(210px, 0.9fr);
       align-items: center;
       gap: 8px;
     }
@@ -497,6 +503,8 @@ HTML = r"""<!doctype html>
     }
     button:hover { background: #e9f4f2; border-color: #99d4ca; }
     button.paused { background: #fff7ed; border-color: #fed7aa; color: #9a3412; }
+    button.clear { background: #fff1f2; border-color: #fecdd3; color: #be123c; }
+    button.clear:hover { background: #ffe4e6; border-color: #fda4af; }
     .chip {
       min-width: 0;
       height: 34px;
@@ -703,7 +711,7 @@ HTML = r"""<!doctype html>
     }
     @media (max-width: 1200px) {
       header { grid-template-columns: 170px minmax(0, 1fr); padding-left: 16px; padding-right: 16px; }
-      .header-right { grid-template-columns: minmax(120px, 0.8fr) minmax(130px, 1fr) minmax(130px, 1fr) 80px minmax(120px, 0.8fr); gap: 6px; }
+      .header-right { grid-template-columns: minmax(120px, 0.8fr) minmax(130px, 1fr) minmax(130px, 1fr) 80px 80px minmax(120px, 0.8fr); gap: 6px; }
       .chip { font-size: 12px; padding: 0 7px; }
       .legend { gap: 10px; font-size: 11px; }
       .legend-title { flex-basis: 86px; }
@@ -728,6 +736,7 @@ HTML = r"""<!doctype html>
       <div id="humanState" class="chip">状态 等待中</div>
       <div id="espectreState" class="chip">ESPectre 校准中</div>
       <button id="pauseBtn" type="button">暂停</button>
+      <button id="clearBtn" class="clear" type="button">清空</button>
       <div id="status" class="chip">connecting...</div>
     </div>
   </header>
@@ -830,6 +839,7 @@ HTML = r"""<!doctype html>
     const humanStateEl = document.getElementById("humanState");
     const espectreStateEl = document.getElementById("espectreState");
     const pauseBtn = document.getElementById("pauseBtn");
+    const clearBtn = document.getElementById("clearBtn");
     const rawScoreCanvas = document.getElementById("rawScore");
     const algoDebugCanvas = document.getElementById("algoDebug");
     const rssiCanvas = document.getElementById("rssiPlot");
@@ -1066,6 +1076,7 @@ HTML = r"""<!doctype html>
       if (!rawData.length) {
         drawText(ctx, "waiting for global_norm...", 58, 36);
         rawReadoutEl.textContent = "waiting for global_norm...";
+        rawReadoutEl.style.color = "";
         return;
       }
       const globalRows = rawData.map(row => ({
@@ -1099,6 +1110,7 @@ HTML = r"""<!doctype html>
       if (!rawData.length) {
         drawText(ctx, "waiting for ESPectre-like...", 58, 36);
         debugReadoutEl.textContent = "waiting for ESPectre-like...";
+        debugReadoutEl.style.color = "";
         return;
       }
       const espectreRows = rawData.map(row => ({
@@ -1136,6 +1148,7 @@ HTML = r"""<!doctype html>
       if (!rawData.length) {
         drawText(ctx, "waiting for RSSI...", 58, 36);
         rssiReadoutEl.textContent = "waiting for RSSI...";
+        rssiReadoutEl.style.color = "";
         return;
       }
       const rows = smoothedRows(rawData, ["rssi"], Math.min(5, smoothSamples));
@@ -1166,6 +1179,7 @@ HTML = r"""<!doctype html>
         // 兼容旧固件或关闭 subband 的数据流，没有扩展字段时页面不报错。
         drawText(ctx, "subband disabled", 58, 36);
         bandReadoutEl.textContent = "subband disabled";
+        bandReadoutEl.style.color = "";
         return;
       }
       const keys = ["band0_score", "band1_score", "band2_score", "band3_score", "subband_norm_score"];
@@ -1198,6 +1212,12 @@ HTML = r"""<!doctype html>
       paused = !paused;
       pauseBtn.textContent = paused ? "继续" : "暂停";
       pauseBtn.classList.toggle("paused", paused);
+      redraw();
+    });
+    clearBtn.addEventListener("click", () => {
+      rawData.length = 0;
+      bandCardsEl.innerHTML = "";
+      subbandStatusEl.textContent = "subband disabled";
       redraw();
     });
     setInterval(redraw, 120);
@@ -1282,12 +1302,14 @@ def main() -> None:
     parser.add_argument("--max-points", type=int, default=3600, help="浏览器中保留的最大 CSI 帧数。")
     parser.add_argument("--smooth-samples", type=int, default=7, help="仅用于显示的移动平均窗口。")
     parser.add_argument("--score-max", type=float, default=0.30, help="CSI 分数曲线固定 Y 轴上限。")
+    parser.add_argument("--serial-idle-reopen", type=float, default=3.0, help="串口收到过数据后连续空读多久自动重开。")
     parser.add_argument("--no-open", action="store_true", help="不自动打开浏览器。")
     args = parser.parse_args()
 
     args.max_points = max(60, args.max_points)
     args.smooth_samples = max(1, args.smooth_samples)
     args.score_max = max(0.001, args.score_max)
+    args.serial_idle_reopen = max(1.0, args.serial_idle_reopen)
 
     state = PlotState()
     stop_event = threading.Event()
