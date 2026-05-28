@@ -1,10 +1,13 @@
 #include "mic_adc_test.h"
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "mic_adc_pcm.h"
-#include "mic_serial_output.h"
+#include "mic_asr_doubao.h"
 #include "mic_vad.h"
+#include "wifi_manager.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -24,6 +27,45 @@ static adc_continuous_handle_t s_adc_handle;
 
 /* 任务句柄：用于防止重复创建 Mic ADC 测试任务。 */
 static TaskHandle_t s_mic_adc_task_handle;
+
+/* ASR 流式链路只保留这个小环形预缓存，不再分配整句 PCM 缓存，给 WebSocket/TLS 留堆内存。 */
+static int16_t s_mic_asr_pre_roll_storage[MIC_ADC_ASR_PRE_ROLL_SAMPLES];
+static int16_t s_mic_asr_live_chunk_storage[MIC_ADC_ASR_LIVE_CHUNK_SAMPLES];
+static char s_mic_asr_result_text[MIC_ASR_DOUBAO_RESULT_TEXT_MAX_LEN];
+static uint8_t s_mic_adc_raw_buffer[MIC_ADC_READ_BYTES];
+static adc_continuous_data_t s_mic_adc_parsed_buffer[MIC_ADC_READ_BYTES / SOC_ADC_DIGI_RESULT_BYTES];
+
+/**
+ * @brief mic_adc_test 内部的 ASR 流式会话状态。
+ *
+ * 状态含义：
+ * - IDLE：未建立 ASR 会话，只允许把当前安静期 PCM 写入 pre-roll 环形缓存。
+ * - STREAMING：VOICE_START 后 ASR start 成功，只允许在这个状态发送 pre-roll 和实时 PCM。
+ * - FINISHING：VOICE_END 后立即进入，正在调用 finish/stop 收尾，禁止继续发送 pre-roll 和 PCM。
+ */
+typedef enum {
+    MIC_ADC_ASR_STATE_IDLE = 0,    // 空闲态：只维护下一句话的句首预缓存。
+    MIC_ADC_ASR_STATE_STREAMING,   // 流式态：当前 ASR 会话可接收 pre-roll 和 PCM。
+    MIC_ADC_ASR_STATE_FINISHING,   // 收尾态：当前会话正在结束，新的音频样本全部丢弃。
+} mic_adc_asr_state_t;
+
+/**
+ * @brief ASR 预缓存和流式状态。
+ *
+ * 调用方法：mic_adc_test_task() 创建后先调用 mic_adc_asr_stream_init()。
+ * 每个 PCM 样本调用 mic_adc_asr_stream_push_sample()，VAD 事件由
+ * mic_adc_window_report() 调用 start/finish 挂接。
+ */
+typedef struct {
+    int16_t *pre_roll_samples;       // 句首预缓存环形数组，由调用方提供。
+    size_t pre_roll_capacity_samples;// 预缓存最大样本数。
+    size_t pre_roll_sample_count;    // 当前有效预缓存样本数。
+    size_t pre_roll_write_index;     // 下一次写入位置。
+    int16_t *live_chunk_samples;      // ASR 已启动后的实时小批量发送缓冲，由静态存储提供。
+    size_t live_chunk_capacity_samples;// live_chunk_samples 可容纳的样本数。
+    size_t live_chunk_sample_count;   // 当前 live_chunk 中已累计的样本数。
+    mic_adc_asr_state_t state;        // ASR 会话三态；只有 STREAMING 允许向豆包发送音频。
+} mic_adc_asr_stream_t;
 
 /**
  * @brief 一个串口统计窗口内的 Mic ADC 原始数据累加状态。
@@ -77,6 +119,265 @@ static uint32_t mic_adc_isqrt_u64(uint64_t value)
     }
 
     return (uint32_t)result;
+}
+
+/**
+ * @brief 初始化 ASR 流式状态。
+ *
+ * 调用方法：Mic ADC 任务启动时调用一次。预缓存默认 500 ms，最大由编译期检查
+ * 限制为不超过 1000 ms，用于弥补 VAD 帧级判断导致的句首延迟。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ * @param pre_roll_storage 预缓存数组，不能为空。
+ * @param pre_roll_capacity_samples 预缓存数组可容纳的样本数。
+ */
+static void mic_adc_asr_stream_init(mic_adc_asr_stream_t *stream,
+                                    int16_t *pre_roll_storage,
+                                    size_t pre_roll_capacity_samples,
+                                    int16_t *live_chunk_storage,
+                                    size_t live_chunk_capacity_samples)
+{
+    if (stream == NULL) {
+        return;
+    }
+
+    stream->pre_roll_samples = pre_roll_storage;
+    stream->pre_roll_capacity_samples = pre_roll_capacity_samples;
+    stream->pre_roll_sample_count = 0;
+    stream->pre_roll_write_index = 0;
+    stream->live_chunk_samples = live_chunk_storage;
+    stream->live_chunk_capacity_samples = live_chunk_capacity_samples;
+    stream->live_chunk_sample_count = 0;
+    stream->state = MIC_ADC_ASR_STATE_IDLE;
+}
+
+/**
+ * @brief 写入一个样本到 ASR 句首预缓存。
+ *
+ * 调用方法：ASR 状态为 IDLE 时，mic_adc_asr_stream_push_sample() 每收到一个 PCM 样本调用。
+ * STREAMING 和 FINISHING 状态禁止写 pre-roll，避免当前会话音频或收尾期音频污染下一句话。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ * @param pcm_sample int16_t PCM 样本。
+ */
+static void mic_adc_asr_stream_push_pre_roll(mic_adc_asr_stream_t *stream, int16_t pcm_sample)
+{
+    if (stream == NULL ||
+        stream->pre_roll_samples == NULL ||
+        stream->pre_roll_capacity_samples == 0) {
+        return;
+    }
+
+    stream->pre_roll_samples[stream->pre_roll_write_index] = pcm_sample;
+    stream->pre_roll_write_index++;
+    if (stream->pre_roll_write_index >= stream->pre_roll_capacity_samples) {
+        stream->pre_roll_write_index = 0;
+    }
+    if (stream->pre_roll_sample_count < stream->pre_roll_capacity_samples) {
+        stream->pre_roll_sample_count++;
+    }
+}
+
+/**
+ * @brief 清空 ASR 句首预缓存。
+ *
+ * 调用方法：pre-roll 已经发送给 ASR、ASR start 失败或 finish 完成后调用，
+ * 避免下一段语音开始太快时混入上一段缓存。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ */
+static void mic_adc_asr_stream_clear_pre_roll(mic_adc_asr_stream_t *stream)
+{
+    if (stream == NULL) {
+        return;
+    }
+
+    stream->pre_roll_sample_count = 0;
+    stream->pre_roll_write_index = 0;
+}
+
+/**
+ * @brief 把 ASR 预缓存按时间顺序发送给豆包 ASR。
+ *
+ * 调用方法：mic_adc_asr_stream_activate() 在 VAD 检测到 VOICE_START 且 ASR start
+ * 成功后调用。函数开头再次检查状态，只有 STREAMING 才允许调用
+ * mic_asr_doubao_send_pcm()，确保 FINISHING 期间不会继续补发句首缓存。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ * @return 成功返回 ESP_OK；发送失败返回错误码。
+ */
+static esp_err_t mic_adc_asr_stream_send_pre_roll(const mic_adc_asr_stream_t *stream)
+{
+    if (stream == NULL || stream->state != MIC_ADC_ASR_STATE_STREAMING ||
+        stream->pre_roll_samples == NULL ||
+        stream->pre_roll_sample_count == 0) {
+        return ESP_OK;
+    }
+
+    size_t start_index = 0;
+    if (stream->pre_roll_sample_count == stream->pre_roll_capacity_samples) {
+        start_index = stream->pre_roll_write_index;
+    }
+
+    for (size_t i = 0; i < stream->pre_roll_sample_count; i++) {
+        size_t read_index = start_index + i;
+        if (read_index >= stream->pre_roll_capacity_samples) {
+            read_index -= stream->pre_roll_capacity_samples;
+        }
+
+        esp_err_t ret = mic_asr_doubao_send_pcm(&stream->pre_roll_samples[read_index],
+                                                sizeof(int16_t));
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    return ESP_OK;
+}
+
+/**
+ * @brief 在 VAD VOICE_START 时启动 ASR 会话，并进入 STREAMING 后发送句首预缓存。
+ *
+ * 调用方法：mic_adc_window_report() 检测到 MIC_VAD_EVENT_VOICE_START 后调用。
+ * 只有 IDLE 才会响应 VOICE_START；start 成功后进入 STREAMING，随后才允许发送
+ * pre-roll。start 或 pre-roll 发送失败都直接回到 IDLE，并清空本轮 pre-roll 状态。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ * @return ASR 已进入 PCM 发送状态返回 true；失败返回 false。
+ */
+static bool mic_adc_asr_stream_activate(mic_adc_asr_stream_t *stream)
+{
+    if (stream == NULL) {
+        return false;
+    }
+    if (stream->state != MIC_ADC_ASR_STATE_IDLE) {
+        return false;
+    }
+
+    esp_err_t ret = mic_asr_doubao_start();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ASR start failed: %s", esp_err_to_name(ret));
+        stream->state = MIC_ADC_ASR_STATE_IDLE;
+        stream->live_chunk_sample_count = 0;
+        mic_adc_asr_stream_clear_pre_roll(stream);
+        return false;
+    }
+
+    stream->state = MIC_ADC_ASR_STATE_STREAMING;
+    stream->live_chunk_sample_count = 0;
+    ret = mic_adc_asr_stream_send_pre_roll(stream);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ASR send pre-roll failed: %s", esp_err_to_name(ret));
+        mic_asr_doubao_stop();
+        stream->state = MIC_ADC_ASR_STATE_IDLE;
+        stream->live_chunk_sample_count = 0;
+        mic_adc_asr_stream_clear_pre_roll(stream);
+        return false;
+    }
+
+    mic_adc_asr_stream_clear_pre_roll(stream);
+    return true;
+}
+
+/**
+ * @brief 发送 ASR 实时小批量缓冲中的 PCM。
+ *
+ * 调用方法：STREAMING 状态下 live_chunk 凑满时调用。它只减少
+ * send_pcm() 调用次数，豆包真正的 MIC_ASR_DOUBAO_PACKET_BYTES 分包仍由
+ * mic_asr_doubao_send_pcm() 完成。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ * @return 成功返回 ESP_OK；发送失败返回错误码。
+ */
+static esp_err_t mic_adc_asr_stream_flush_live_chunk(mic_adc_asr_stream_t *stream)
+{
+    if (stream == NULL || stream->state != MIC_ADC_ASR_STATE_STREAMING ||
+        stream->live_chunk_sample_count == 0) {
+        return ESP_OK;
+    }
+
+    size_t bytes = stream->live_chunk_sample_count * sizeof(stream->live_chunk_samples[0]);
+    esp_err_t ret = mic_asr_doubao_send_pcm(stream->live_chunk_samples, bytes);
+    if (ret == ESP_OK) {
+        stream->live_chunk_sample_count = 0;
+    }
+    return ret;
+}
+
+/**
+ * @brief 向 ASR 流式链路追加一个 PCM 样本。
+ *
+ * 调用方法：每得到一个 int16_t PCM 样本就调用。
+ * - IDLE：只写入 500 ms 小环形 pre-roll。
+ * - STREAMING：累计 live_chunk，凑满后调用 mic_asr_doubao_send_pcm()。
+ * - FINISHING：直接丢弃样本，禁止继续发送 pre-roll 和 PCM。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ * @param pcm_sample int16_t PCM 样本。
+ */
+static void mic_adc_asr_stream_push_sample(mic_adc_asr_stream_t *stream, int16_t pcm_sample)
+{
+    if (stream == NULL) {
+        return;
+    }
+
+    if (stream->state == MIC_ADC_ASR_STATE_IDLE) {
+        mic_adc_asr_stream_push_pre_roll(stream, pcm_sample);
+        return;
+    }
+    if (stream->state != MIC_ADC_ASR_STATE_STREAMING) {
+        return;
+    }
+
+    if (stream->live_chunk_samples == NULL ||
+        stream->live_chunk_capacity_samples == 0) {
+        return;
+    }
+
+    stream->live_chunk_samples[stream->live_chunk_sample_count] = pcm_sample;
+    stream->live_chunk_sample_count++;
+    if (stream->live_chunk_sample_count < stream->live_chunk_capacity_samples) {
+        return;
+    }
+
+    esp_err_t ret = mic_adc_asr_stream_flush_live_chunk(stream);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ASR send PCM failed: %s", esp_err_to_name(ret));
+        mic_asr_doubao_stop();
+        stream->state = MIC_ADC_ASR_STATE_IDLE;
+        stream->live_chunk_sample_count = 0;
+        mic_adc_asr_stream_clear_pre_roll(stream);
+    }
+}
+
+/**
+ * @brief 在 VAD VOICE_END 时结束 ASR，并关闭 WebSocket。
+ *
+ * 调用方法：mic_adc_window_report() 检测到 MIC_VAD_EVENT_VOICE_END 后调用。
+ * 函数一进入就把状态改为 FINISHING，因此 ADC 循环期间再来的样本不会继续发送
+ * pre-roll 或 PCM。finish 完成后 stop 释放资源，最后清空本轮缓存并回到 IDLE。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ */
+static void mic_adc_asr_stream_finish(mic_adc_asr_stream_t *stream)
+{
+    if (stream == NULL || stream->state != MIC_ADC_ASR_STATE_STREAMING) {
+        return;
+    }
+
+    stream->state = MIC_ADC_ASR_STATE_FINISHING;
+    stream->live_chunk_sample_count = 0;
+
+    s_mic_asr_result_text[0] = '\0';
+    esp_err_t ret = mic_asr_doubao_finish(s_mic_asr_result_text, sizeof(s_mic_asr_result_text));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ASR finish failed: %s", esp_err_to_name(ret));
+    }
+
+    mic_asr_doubao_stop();
+    stream->state = MIC_ADC_ASR_STATE_IDLE;
+    stream->live_chunk_sample_count = 0;
+    mic_adc_asr_stream_clear_pre_roll(stream);
 }
 
 /**
@@ -184,32 +485,27 @@ static void mic_adc_window_add(mic_adc_window_t *window, uint32_t raw, int16_t p
 }
 
 /**
- * @brief 计算当前统计窗口的 Mic 指标，并交给串口输出模块打印。
+ * @brief 计算当前统计窗口的 Mic 指标，并驱动 VAD 和 ASR 流程。
  *
  * 调用方法：mic_adc_test_task() 累计到 MIC_ADC_REPORT_SAMPLES 个有效样本后调用。
- * 输出字段说明：
- * - adc_last/adc_min/adc_max/adc_avg: ADC raw 的最近值、上下沿和平均值。
- * - adc_rms/pcm_rms: 去直流后的 RMS，安静时小，说话时变大。
- * - adc_p2p/pcm_p2p: 峰峰值，用于观察波形摆幅。
- * - *_clip_*: 当前窗口削顶次数，非 0 表示输入或 PCM 已接近过载。
- * - vad_state/vad_event: VAD 当前状态码和本帧事件码。
- * - VOICE_START/VOICE_END: 串口输出模块根据 VAD 事件打印语音活动事件。
+ * 本函数只维护 VAD 和 ASR 流式发送，不再使用整句 PCM 缓存。
  *
  * @param window 已累计完成的统计窗口。
  * @param vad VAD 状态机，不能为空。
+ * @param asr_stream ASR 流式状态，不能为空。
  */
-static void mic_adc_window_report(const mic_adc_window_t *window, mic_vad_t *vad)
+static void mic_adc_window_report(const mic_adc_window_t *window,
+                                  mic_vad_t *vad,
+                                  mic_adc_asr_stream_t *asr_stream)
 {
-    if (window->count == 0) {
+    if (window->count == 0 || vad == NULL || asr_stream == NULL) {
         return;
     }
 
-    uint32_t avg_raw = (uint32_t)((window->sum_raw + window->count / 2) / window->count);
     uint32_t adc_rms = mic_adc_calc_ac_rms(window->count,
                                            (int64_t)window->sum_raw,
                                            window->sum_square_raw);
     uint32_t adc_p2p = window->max_raw - window->min_raw;
-    int32_t avg_pcm = (int32_t)(window->sum_pcm / (int64_t)window->count);
     uint32_t pcm_rms = mic_adc_calc_ac_rms(window->count,
                                            window->sum_pcm,
                                            window->sum_square_pcm);
@@ -228,38 +524,26 @@ static void mic_adc_window_report(const mic_adc_window_t *window, mic_vad_t *vad
     };
     mic_vad_event_t vad_event = mic_vad_process(vad, &vad_features);
 
-    mic_serial_output_frame_t output_frame = {
-        .gpio_num = MIC_ADC_GPIO_NUM,
-        .adc_unit = (uint32_t)MIC_ADC_UNIT + 1,
-        .adc_channel = MIC_ADC_CHANNEL,
-        .samples = window->count,
-        .adc_last = window->last_raw,
-        .adc_min = window->min_raw,
-        .adc_max = window->max_raw,
-        .adc_avg = avg_raw,
-        .adc_rms = adc_rms,
-        .adc_p2p = adc_p2p,
-        .adc_clip_low = window->adc_clip_low,
-        .adc_clip_high = window->adc_clip_high,
-        .pcm_last = window->last_pcm,
-        .pcm_min = window->min_pcm,
-        .pcm_max = window->max_pcm,
-        .pcm_avg = avg_pcm,
-        .pcm_rms = pcm_rms,
-        .pcm_p2p = pcm_p2p,
-        .pcm_clip_low = window->pcm_clip_low,
-        .pcm_clip_high = window->pcm_clip_high,
-        .clipped = clipped,
-        .vad_state = vad->state,
-        .vad_event = vad_event,
-    };
-    mic_serial_output_print_adc_frame(&output_frame);
-
     if (vad_event == MIC_VAD_EVENT_VOICE_START) {
-        mic_serial_output_print_voice_start(&output_frame);
+        // ASR 阶段采用边采样边发送：这里只打开 PCM 发送闸门并发送句首小预缓存，不再启动整句 PCM 缓存。
+        (void)mic_adc_asr_stream_activate(asr_stream);
     } else if (vad_event == MIC_VAD_EVENT_VOICE_END) {
-        mic_serial_output_print_voice_end(&output_frame);
+        // 句尾只发送剩余 live_chunk 和 last audio packet，随后关闭 WebSocket。
+        mic_adc_asr_stream_finish(asr_stream);
     }
+}
+
+/**
+ * @brief 打印 mic_adc_test 任务栈剩余水位。
+ *
+ * 调用方法：任务启动后先打印一次；采集循环内由调用方按
+ * MIC_ADC_STACK_LOG_INTERVAL_MS 节流，避免栈诊断日志本身变成高频 vfprintf 压力源。
+ */
+static void mic_adc_log_stack_high_water_mark(void)
+{
+    ESP_LOGI(TAG,
+             "mic_adc_test uxTaskGetStackHighWaterMark: %u",
+             (unsigned int)uxTaskGetStackHighWaterMark(NULL));
 }
 
 /**
@@ -309,38 +593,56 @@ static esp_err_t mic_adc_continuous_init(adc_continuous_handle_t *out_handle)
 /**
  * @brief Mic ADC continuous 采样和串口统计任务。
  *
- * 调用方法：由 mic_adc_test_start() 通过 xTaskCreate() 创建，不要在外部直接调用。
+ * 调用方法：由 mic_adc_test_start() 在 WiFi 稳定且 ADC continuous 启动后通过 xTaskCreate() 创建。
+ * 不要在外部直接调用。
  * 任务流程：
  * 1. 从 ADC continuous 驱动读取 DMA 原始帧。
  * 2. 调用 adc_continuous_parse_data() 解析出 ADC 单元、通道和 raw 值。
  * 3. 只保留 GPIO6 对应的 ADC1_CH5 有效样本。
  * 4. 调用独立的 mic_adc_pcm 模块把 raw 转成 16000 Hz/mono/int16/little-endian PCM。
- * 5. 累计一个统计窗口后，交给 mic_serial_output 模块输出 MIC_ADC CSV 行。
+ * 5. 每个 PCM 样本实时送入 ASR 三态链路，不再写入整句 PCM 缓存。
+ * 6. 累计一个统计窗口后，更新 VAD；VOICE_START 启动豆包 ASR，VOICE_END 进入 FINISHING。
  *
  * @param arg adc_continuous_handle_t 句柄，由 mic_adc_test_start() 传入。
  */
 static void mic_adc_test_task(void *arg)
 {
     adc_continuous_handle_t handle = (adc_continuous_handle_t)arg;
-    uint8_t raw_buffer[MIC_ADC_READ_BYTES] = {0};
-    adc_continuous_data_t parsed[MIC_ADC_READ_BYTES / SOC_ADC_DIGI_RESULT_BYTES] = {0};
     mic_adc_window_t window;
     mic_adc_pcm_converter_t pcm_converter;
     mic_vad_t vad;
+    mic_adc_asr_stream_t asr_stream;
+    TickType_t last_stack_log_tick = 0;
 
     mic_adc_pcm_converter_init(&pcm_converter);
     mic_vad_init(&vad);
+    mic_adc_asr_stream_init(&asr_stream,
+                            s_mic_asr_pre_roll_storage,
+                            MIC_ADC_ASR_PRE_ROLL_SAMPLES,
+                            s_mic_asr_live_chunk_storage,
+                            MIC_ADC_ASR_LIVE_CHUNK_SAMPLES);
     mic_adc_window_reset(&window);
+    ESP_LOGI(TAG, "mic_adc_test task started");
+    mic_adc_log_stack_high_water_mark();
+    last_stack_log_tick = xTaskGetTickCount();
 
     while (1) {
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_stack_log_tick) >= pdMS_TO_TICKS(MIC_ADC_STACK_LOG_INTERVAL_MS)) {
+            last_stack_log_tick = now;
+            mic_adc_log_stack_high_water_mark();
+        }
+
         uint32_t read_bytes = 0;
         esp_err_t ret = adc_continuous_read(handle,
-                                            raw_buffer,
-                                            sizeof(raw_buffer),
+                                            s_mic_adc_raw_buffer,
+                                            sizeof(s_mic_adc_raw_buffer),
                                             &read_bytes,
                                             MIC_ADC_READ_TIMEOUT_MS);
         if (ret == ESP_ERR_TIMEOUT) {
+#if MIC_ADC_ENABLE_LOOP_DEBUG_LOG
             ESP_LOGW(TAG, "ADC read timeout");
+#endif
             continue;
         }
         if (ret != ESP_OK) {
@@ -350,23 +652,30 @@ static void mic_adc_test_task(void *arg)
         }
 
         uint32_t sample_count = 0;
-        ret = adc_continuous_parse_data(handle, raw_buffer, read_bytes, parsed, &sample_count);
+        ret = adc_continuous_parse_data(handle,
+                                        s_mic_adc_raw_buffer,
+                                        read_bytes,
+                                        s_mic_adc_parsed_buffer,
+                                        &sample_count);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "ADC parse failed: %s", esp_err_to_name(ret));
             continue;
         }
 
         for (uint32_t i = 0; i < sample_count; i++) {
-            if (!parsed[i].valid ||
-                parsed[i].unit != MIC_ADC_UNIT ||
-                parsed[i].channel != MIC_ADC_CHANNEL) {
+            if (!s_mic_adc_parsed_buffer[i].valid ||
+                s_mic_adc_parsed_buffer[i].unit != MIC_ADC_UNIT ||
+                s_mic_adc_parsed_buffer[i].channel != MIC_ADC_CHANNEL) {
                 continue;
             }
 
-            int16_t pcm_sample = mic_adc_pcm_convert_sample(&pcm_converter, parsed[i].raw_data);
-            mic_adc_window_add(&window, parsed[i].raw_data, pcm_sample);
+            int16_t pcm_sample = mic_adc_pcm_convert_sample(&pcm_converter,
+                                                            s_mic_adc_parsed_buffer[i].raw_data);
+            // ASR 采用流式发送：未触发 VAD 时写入小预缓存，触发后边采样边发送 PCM。
+            mic_adc_asr_stream_push_sample(&asr_stream, pcm_sample);
+            mic_adc_window_add(&window, s_mic_adc_parsed_buffer[i].raw_data, pcm_sample);
             if (window.count >= MIC_ADC_REPORT_SAMPLES) {
-                mic_adc_window_report(&window, &vad);
+                mic_adc_window_report(&window, &vad, &asr_stream);
                 mic_adc_window_reset(&window);
             }
         }
@@ -376,8 +685,10 @@ static void mic_adc_test_task(void *arg)
 /**
  * @brief 启动 Mic ADC continuous 采样测试。
  *
- * 调用方法：app_main() 或其他上层入口在系统启动后调用一次。
- * 本函数只依赖 ESP-IDF ADC/FreeRTOS/日志模块，不依赖 WiFi 管理器，方便后续单独移植。
+ * 调用方法：app_main() 在 WiFi 已连接且稳定后调用一次。
+ * 正确启动顺序必须是：WiFi 稳定后先启动 Mic ADC continuous；ADC 任务在 IDLE
+ * 状态只收集 pre-roll；VAD 触发 VOICE_START 时再调用 mic_asr_doubao_start() 建立
+ * 本次 ASR 会话并进入 STREAMING。
  *
  * @return 成功返回 ESP_OK，失败返回 ESP-IDF 错误码。
  */
@@ -387,9 +698,18 @@ esp_err_t mic_adc_test_start(void)
         return ESP_OK;
     }
 
-    ESP_RETURN_ON_ERROR(mic_adc_continuous_init(&s_adc_handle), TAG, "ADC continuous init failed");
+    if (!wifi_is_stable()) {
+        ESP_LOGW(TAG, "WiFi is not stable yet, skip Mic ADC/ASR start");
+        return ESP_ERR_INVALID_STATE;
+    }
 
-    esp_err_t ret = adc_continuous_start(s_adc_handle);
+    esp_err_t ret = mic_adc_continuous_init(&s_adc_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADC continuous init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = adc_continuous_start(s_adc_handle);
     if (ret != ESP_OK) {
         adc_continuous_deinit(s_adc_handle);
         s_adc_handle = NULL;
@@ -399,7 +719,7 @@ esp_err_t mic_adc_test_start(void)
 
     BaseType_t task_created = xTaskCreate(mic_adc_test_task,
                                           "mic_adc_test",
-                                          MIC_ADC_TASK_STACK,
+                                          MIC_ADC_TEST_TASK_STACK_SIZE,
                                           s_adc_handle,
                                           MIC_ADC_TASK_PRIORITY,
                                           &s_mic_adc_task_handle);

@@ -18,6 +18,7 @@ static const char *TAG = "wifi_manager";
 /* FreeRTOS 事件组：用于标记 Wi-Fi 是否已经连接。 */
 static EventGroupHandle_t s_wifi_event_group;
 static TaskHandle_t s_wifi_reconnect_task_handle = NULL;
+static TickType_t s_wifi_connected_tick;
 
 /* 事件组位：连接状态、重连请求和本轮连接断开分别占用一个 bit。 */
 enum {
@@ -57,7 +58,7 @@ static esp_err_t scan_strongest_known_wifi(const known_wifi_t **selected_wifi, i
     *selected_wifi = NULL;
     *selected_rssi = INT8_MIN;
 
-    ESP_LOGI(TAG, "Scanning known Wi-Fi...");
+    ESP_LOGD(TAG, "Scanning known Wi-Fi...");
 
     wifi_scan_config_t scan_config = {
         .ssid = NULL,
@@ -77,7 +78,7 @@ static esp_err_t scan_strongest_known_wifi(const known_wifi_t **selected_wifi, i
 
     uint16_t ap_count = 0;
     ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
-    ESP_LOGI(TAG, "Found %d access points", ap_count);
+    ESP_LOGD(TAG, "Found %d access points", ap_count);
 
     if (ap_count == 0) {
         return ESP_ERR_NOT_FOUND;
@@ -111,11 +112,11 @@ static esp_err_t scan_strongest_known_wifi(const known_wifi_t **selected_wifi, i
     free(ap_list);
 
     if (*selected_wifi == NULL) {
-        ESP_LOGW(TAG, "No known Wi-Fi found");
+        ESP_LOGD(TAG, "No known Wi-Fi found");
         return ESP_ERR_NOT_FOUND;
     }
 
-    ESP_LOGI(TAG, "Selected Wi-Fi: %s, RSSI: %d", (*selected_wifi)->ssid, *selected_rssi);
+    ESP_LOGD(TAG, "Selected Wi-Fi: %s, RSSI: %d", (*selected_wifi)->ssid, *selected_rssi);
     return ESP_OK;
 }
 
@@ -188,7 +189,7 @@ static void wifi_reconnect_task(void *arg)
 
             esp_err_t ret = scan_strongest_known_wifi(&selected_wifi, &selected_rssi);
             if (ret != ESP_OK) {
-                ESP_LOGW(TAG,
+                ESP_LOGD(TAG,
                          "No connectable known Wi-Fi yet, rescan in %d ms",
                          WIFI_RESCAN_DELAY_MS);
                 vTaskDelay(pdMS_TO_TICKS(WIFI_RESCAN_DELAY_MS));
@@ -213,11 +214,11 @@ static void wifi_reconnect_task(void *arg)
             }
 
             if (bits & WIFI_DISCONNECTED_BIT) {
-                ESP_LOGW(TAG,
+                ESP_LOGD(TAG,
                          "Wi-Fi connection attempt failed, rescan in %d ms",
                          WIFI_RESCAN_DELAY_MS);
             } else {
-                ESP_LOGW(TAG,
+                ESP_LOGD(TAG,
                          "Wi-Fi connection timeout, rescan in %d ms",
                          WIFI_RESCAN_DELAY_MS);
                 esp_wifi_disconnect();
@@ -243,7 +244,7 @@ static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "Wi-Fi STA started");
+        ESP_LOGD(TAG, "Wi-Fi STA started");
         xEventGroupSetBits(s_wifi_event_group, WIFI_RECONNECT_BIT);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *disconnected =
@@ -252,11 +253,13 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         xEventGroupSetBits(s_wifi_event_group, WIFI_RECONNECT_BIT | WIFI_DISCONNECTED_BIT);
+        s_wifi_connected_tick = 0;
         ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d, rescan scheduled", reason);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupClearBits(s_wifi_event_group, WIFI_RECONNECT_BIT | WIFI_DISCONNECTED_BIT);
+        s_wifi_connected_tick = xTaskGetTickCount();
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -311,7 +314,7 @@ esp_err_t wifi_manager_init(void)
     // 关闭 WiFi 省电，保持 STA 持续接收无线帧，避免长时间无数据。
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
-    ESP_LOGI(TAG, "Wi-Fi manager initialized");
+    ESP_LOGD(TAG, "Wi-Fi manager initialized");
     return ESP_OK;
 }
 
@@ -364,7 +367,28 @@ esp_err_t wifi_connect_to_ap(void)
  */
 bool wifi_is_connected(void)
 {
+    if (s_wifi_event_group == NULL) {
+        return false;
+    }
+
     return (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+}
+
+/**
+ * @brief 查询 WiFi 是否已经连续稳定连接。
+ *
+ * 参数：无。
+ * 调用方法：需要发起云端请求前调用，避免刚拿到 IP 或正在断线重连时分配 TLS 资源。
+ * @return 已连接且稳定超过 WIFI_STABLE_REQUIRED_MS 返回 true，否则返回 false。
+ */
+bool wifi_is_stable(void)
+{
+    if (!wifi_is_connected() || s_wifi_connected_tick == 0) {
+        return false;
+    }
+
+    TickType_t connected_ticks = xTaskGetTickCount() - s_wifi_connected_tick;
+    return connected_ticks >= pdMS_TO_TICKS(WIFI_STABLE_REQUIRED_MS);
 }
 
 /**

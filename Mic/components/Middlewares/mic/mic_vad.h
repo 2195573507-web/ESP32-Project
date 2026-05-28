@@ -10,32 +10,25 @@
  * 本模块不读取 ADC、不转换 PCM、不依赖 FreeRTOS；只根据一帧统计值判断是否有人声活动。
  */
 
-/* VAD 时间参数：当前 MIC_ADC 约 200 ms 输出一帧统计。 */
+/* VAD 参数：当前 MIC_ADC 每帧 3200 samples / 16000 Hz = 200 ms。 */
 #define MIC_VAD_FRAME_MS           200 // 每帧统计对应的时间。
-#define MIC_VAD_END_HOLD_MS        800 // 连续安静这么久后输出 VOICE_END。
-
-/* VAD 启动阈值：任意一项达到，就认为有语音活动。 */
-#define MIC_VAD_ADC_RMS_START      80   // ADC RMS 启动阈值。
-#define MIC_VAD_ADC_P2P_START      200  // ADC 峰峰值启动阈值。
-#define MIC_VAD_PCM_RMS_START      300  // PCM RMS 启动阈值。
-#define MIC_VAD_PCM_P2P_START      2000 // PCM 峰峰值启动阈值。
-
-/* VAD 安静阈值：全部低于这些值，才算当前帧安静。 */
-#define MIC_VAD_ADC_RMS_STOP       40   // ADC RMS 安静阈值。
-#define MIC_VAD_ADC_P2P_STOP       120  // ADC 峰峰值安静阈值。
-#define MIC_VAD_PCM_RMS_STOP       250  // PCM RMS 安静阈值。
-#define MIC_VAD_PCM_P2P_STOP       1500 // PCM 峰峰值安静阈值。
+#define MIC_VAD_START_RMS          800 // 连续超过该 PCM RMS 才认为开始说话。
+#define MIC_VAD_END_RMS            350 // 连续低于该 PCM RMS 才认为说话结束。
+#define MIC_VAD_START_FRAMES       2   // 连续 2 帧超过阈值才开始，约 400 ms。
+#define MIC_VAD_END_FRAMES         8   // 连续 8 帧低于阈值才结束，约 1.6 s。
+#define MIC_VAD_MIN_SPEECH_FRAMES  2   // 小于 400 ms 的语音忽略。
+#define MIC_VAD_MAX_SPEECH_FRAMES  40  // 最长 8 s，防止卡死。
 
 /**
- * @brief VAD 状态机状态。
+ * @brief VAD 状态机状态
  *
  * 调用方法：上层一般只读 state 做调试，不需要直接修改。
- * 串口状态码：0=IDLE，1=SPEAKING，2=SILENCE_HOLD。
+ * 串口状态码：0=IDLE，1=SPEECH，2=HANGOVER。
  */
 typedef enum {
     MIC_VAD_STATE_IDLE = 0,      // 空闲，当前没有语音。
-    MIC_VAD_STATE_SPEAKING,      // 说话中。
-    MIC_VAD_STATE_SILENCE_HOLD,  // 已变安静，等待结束保持时间。
+    MIC_VAD_STATE_SPEECH = 1,    // 说话中。
+    MIC_VAD_STATE_HANGOVER = 2,  // 已变安静，等待连续结束帧。
 } mic_vad_state_t;
 
 /**
@@ -69,8 +62,10 @@ typedef struct {
  * 调用方法：定义一个 mic_vad_t 变量，先调用 mic_vad_init()，再逐帧调用 mic_vad_process()。
  */
 typedef struct {
-    mic_vad_state_t state;      // 当前状态。
-    uint32_t silence_hold_ms;   // 已连续安静的时间。
+    mic_vad_state_t state;  // 当前状态。
+    int start_count;        // 连续达到开始阈值的帧数。
+    int end_count;          // 连续达到结束阈值的帧数。
+    int speech_frames;      // 当前语音段已持续的帧数。
 } mic_vad_t;
 
 /**

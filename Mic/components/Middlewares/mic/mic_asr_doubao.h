@@ -1,0 +1,104 @@
+#ifndef MIC_ASR_DOUBAO_H
+#define MIC_ASR_DOUBAO_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "esp_err.h"
+
+/**
+ * @file mic_asr_doubao.h
+ * @brief 豆包 ASR WebSocket 二进制业务协议层。
+ *
+ * 本模块只负责豆包 ASR 业务：组装 X-Api-* Header、发送豆包二进制协议帧、
+ * 按 PCM 分包发送音频、解析服务端 result.text。底层 WebSocket/TLS/RFC6455
+ * 帧处理已经拆到 manual_ws 模块。
+ */
+
+/* WebSocket 业务入口：manual_ws 只接收 host/path/port，不写死这些豆包地址。 */
+#define MIC_ASR_DOUBAO_WS_SCHEME             "wss"                                                 // 仅用于日志和 URI 展示。
+#define MIC_ASR_DOUBAO_WS_HOST               "openspeech.bytedance.com"                            // 豆包 ASR 主机名。
+#define MIC_ASR_DOUBAO_WS_PORT               443                                                   // wss TLS 端口。
+#define MIC_ASR_DOUBAO_WS_PATH               "/api/v3/sauc/bigmodel"                               // HTTP Upgrade request-target。
+#define MIC_ASR_DOUBAO_WS_URI                "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel" // 安全日志用完整 URI。
+
+/* 豆包 X-Api-* 业务 Header：由 mic_asr_doubao.c 组装后通过 extra_headers 传给 manual_ws。 */
+#define MIC_ASR_DOUBAO_APP_KEY               "1240212599"                                           // X-Api-App-Key，日志必须脱敏。
+#define MIC_ASR_DOUBAO_ACCESS_KEY            "2XEvwJo3fMNnqlHi40TtJwp6iC7xJ88L"                     // X-Api-Access-Key，敏感凭据。
+#define MIC_ASR_DOUBAO_RESOURCE_ID           "volc.bigasr.sauc.duration"                            // X-Api-Resource-Id。
+#define MIC_ASR_DOUBAO_CONNECT_ID            ""                                                     // 空值表示每次自动生成 UUID。
+
+/* ASR 音频与请求参数：同步写入 full client request JSON 和 PCM 分包逻辑。 */
+#define MIC_ASR_DOUBAO_SAMPLE_RATE           16000                                                  // PCM 采样率：16 kHz。
+#define MIC_ASR_DOUBAO_BITS                  16                                                     // PCM 位深：int16。
+#define MIC_ASR_DOUBAO_CHANNELS              1                                                      // 单声道。
+#define MIC_ASR_DOUBAO_PACKET_MS             50                                                     // 每包音频 50 ms。
+#define MIC_ASR_DOUBAO_PACKET_BYTES          1600                                                   // 16 kHz/16 bit/mono 下 50 ms 字节数。
+#define MIC_ASR_DOUBAO_LANGUAGE              "zh-CN"                                                // 识别语言。
+#define MIC_ASR_DOUBAO_MODEL_NAME            "bigmodel"                                             // 豆包模型名。
+
+/* 运行参数：manual_ws 阻塞接收，超时后 finish() 返回 ESP_ERR_TIMEOUT。 */
+#define MIC_ASR_DOUBAO_RESPONSE_TIMEOUT_MS    15000 // last packet 后等待 result.text。
+#define MIC_ASR_DOUBAO_RESULT_TEXT_MAX_LEN    256   // result.text 输出缓冲区大小。
+#define MIC_ASR_DOUBAO_ENABLE_START_DEBUG_LOG 0     // 启动 URI/heap 诊断，调建连时改 1。
+#define MIC_ASR_DOUBAO_ENABLE_FRAME_DEBUG_LOG 0     // 收发帧和 hex dump，调协议时改 1。
+#define MIC_ASR_DOUBAO_ENABLE_RESULT_PRINT    0     // 结果 ESP_LOG/printf，调识别时改 1。
+#define MIC_ASR_DOUBAO_ENABLE_PCM_QUALITY_LOG 1     // PCM 质量统计日志，排查麦克风输入时改 1，量产可改 0。
+
+/* PCM 质量统计参数：只影响日志判断，不改变 WebSocket 发送协议和音频数据。 */
+#define MIC_ASR_DOUBAO_PCM_QUALITY_LOG_EVERY_PACKETS      10 // 每 10 次 send_pcm() 调用打印一次统计，避免刷屏。
+#define MIC_ASR_DOUBAO_PCM_SILENCE_P2P_THRESHOLD          96 // p2p 小于该值时认为当前包可能接近静音。
+#define MIC_ASR_DOUBAO_PCM_SILENCE_WARN_CONSECUTIVE       5  // 连续 5 个低 p2p 包后提示可能接近静音。
+#define MIC_ASR_DOUBAO_PCM_CLIP_NEAR_MIN                  (-32000) // 接近 int16_t 下限的削波判断阈值。
+#define MIC_ASR_DOUBAO_PCM_CLIP_NEAR_MAX                  32000    // 接近 int16_t 上限的削波判断阈值。
+#define MIC_ASR_DOUBAO_PCM_CLIP_WARN_PERCENT              5        // 单包接近上下限样本占比达到 5% 时提示可能削波。
+
+#if MIC_ASR_DOUBAO_PCM_QUALITY_LOG_EVERY_PACKETS <= 0
+#error "MIC_ASR_DOUBAO_PCM_QUALITY_LOG_EVERY_PACKETS must be greater than 0"
+#endif
+
+/**
+ * @brief 开始一次豆包 ASR 流式识别。
+ *
+ * 调用方法：WiFi 已连接且稳定后、ADC continuous 启动前调用。函数会组装豆包 X-Api-*
+ * Header，调用 manual_ws_connect() 完成 TLS WebSocket 握手，然后发送 full client
+ * request 二进制帧。
+ *
+ * @return 成功返回 ESP_OK；TLS、握手或首包发送失败返回 ESP-IDF 错误码。
+ */
+esp_err_t mic_asr_doubao_start(void);
+
+/**
+ * @brief 向当前 ASR 会话发送 PCM 数据。
+ *
+ * 调用方法：录音过程中持续调用。pcm 必须指向 16 kHz、16 bit、单声道、
+ * little-endian 的 PCM_s16le 数据，bytes 是字节数。函数内部会缓存不足
+ * MIC_ASR_DOUBAO_PACKET_BYTES 的小片段，凑满后按豆包 audio only request 发送。
+ *
+ * @param pcm PCM 数据指针，不能为空。
+ * @param bytes PCM 字节数，必须是 int16_t 的整数倍。
+ * @return 成功返回 ESP_OK；会话未启动或发送失败时返回错误码。
+ */
+esp_err_t mic_asr_doubao_send_pcm(const int16_t *pcm, size_t bytes);
+
+/**
+ * @brief 结束当前 ASR 会话并等待识别文本。
+ *
+ * 调用方法：VAD 检测到 VOICE_END 后调用一次。函数会发送 last audio packet，然后
+ * 阻塞调用 manual_ws_recv_frame() 读取服务端 binary frame，并在解析到 result.text 后返回。
+ *
+ * @param text_buf 输出识别文本缓冲区，可为 NULL；为 NULL 时只打印日志。
+ * @param text_buf_size text_buf 大小。
+ * @return 成功返回 ESP_OK；空识别文本也属于业务成功，超时或服务端错误返回错误码。
+ */
+esp_err_t mic_asr_doubao_finish(char *text_buf, size_t text_buf_size);
+
+/**
+ * @brief 停止当前 ASR 会话并释放资源。
+ *
+ * 调用方法：异常、超时、识别完成或需要中断当前识别时调用。函数会关闭 manual_ws
+ * 连接并清空当前豆包 ASR 会话状态。
+ */
+void mic_asr_doubao_stop(void);
+
+#endif // MIC_ASR_DOUBAO_H

@@ -2,7 +2,9 @@ set(srcs
             wifi/wifi_manager.c
             mic/mic_adc_test.c
             mic/mic_adc_pcm.c
-            mic/mic_serial_output.c
+            mic/mic_asr_doubao.c
+            mic/mic_asr_doubao_parser.c
+            mic/mic_network_diag.c
             mic/mic_vad.c)
 
 set(include_dirs
@@ -15,6 +17,10 @@ set(requires
             esp_netif
             nvs_flash
             esp_adc
+            manual_ws
+            esp-tls
+            json
+            mbedtls
             freertos
             log
             lwip)

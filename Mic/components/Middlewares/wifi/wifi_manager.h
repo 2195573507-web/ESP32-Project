@@ -8,8 +8,9 @@
 /* WiFi 重连参数：调扫描间隔、首次连接等待和任务资源时改这里。 */
 #define WIFI_RESCAN_DELAY_MS          3000  // 找不到 WiFi 后的重扫间隔。
 #define WIFI_CONNECT_TIMEOUT_MS       15000 // 首次连接等待超时。
-#define WIFI_RECONNECT_TASK_STACK     4096  // 重连任务栈大小。
+#define WIFI_RECONNECT_TASK_STACK     3072  // 重连任务栈大小；只做扫描/连接状态机，避免 4096 过度占用 RAM。
 #define WIFI_RECONNECT_TASK_PRIORITY  5     // 重连任务优先级。
+#define WIFI_STABLE_REQUIRED_MS       3000  // 认为 WiFi 稳定所需的连续连接时长。
 
 /**
  * @brief 初始化Wi-Fi管理功能
@@ -48,5 +49,16 @@ bool wifi_get_connected_ssid(char *ssid, size_t ssid_len);
  * @return 已连接返回 true，未连接返回 false。
  */
 bool wifi_is_connected(void);
+
+/**
+ * @brief 判断 WiFi 是否已连接并持续稳定一段时间。
+ *
+ * 调用方法：需要发起云端请求前调用，例如豆包 ASR WebSocket TLS 建连前。
+ * 函数会先确认当前已连接，再确认从最近一次 GOT_IP 到现在已经超过
+ * WIFI_STABLE_REQUIRED_MS。
+ *
+ * @return 已连接且稳定返回 true，否则返回 false。
+ */
+bool wifi_is_stable(void);
 
 #endif // WIFI_MANAGER_H

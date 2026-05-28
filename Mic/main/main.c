@@ -1,9 +1,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_err.h"
 #include "esp_log.h"
 
 #include "mic_adc_test.h"
+#include "mic_network_diag.h"
 #include "wifi_manager.h"
 
 /* 日志标签：只在本文件使用，不作为调试参数。 */
@@ -24,9 +26,6 @@ void app_main(void)
     // 初始化 WiFi 管理器：内部完成 NVS、网络接口、事件循环和 STA 模式初始化。
     ESP_ERROR_CHECK(wifi_manager_init());
 
-    // 启动 Mic ADC continuous 采样测试：OPA_OUT -> GPIO6 / ADC1_CH5。
-    ESP_ERROR_CHECK(mic_adc_test_start());
-
     // 持续扫描并连接已保存列表中当前可用且信号最强的 WiFi。
     ESP_LOGI(TAG, "WiFi connect task start");
     if (wifi_connect_to_ap() != ESP_OK) {
@@ -40,6 +39,31 @@ void app_main(void)
         ESP_LOGI(TAG, "WiFi connected, SSID: %s", connected_ssid);
     } else {
         ESP_LOGI(TAG, "WiFi connected");
+    }
+
+    // 等待 WiFi 连续稳定后直接进入 ASR 测试流程，避免刚拿到 IP 时就分配 TLS/WebSocket 资源。
+    while (!wifi_is_stable()) {
+        ESP_LOGI(TAG, "Waiting for stable WiFi before ASR test");
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+#if MIC_NETWORK_DIAG_ENABLE
+    // 诊断豆包 ASR 网络链路：DNS -> TCP 443 -> TLS，日志会指出具体失败层级。
+    // 默认关闭；需要排查网络问题时，在 mic_network_diag.h 中把 MIC_NETWORK_DIAG_ENABLE 改为 1。
+    esp_err_t diag_ret = mic_network_diag_run();
+    if (diag_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Network diag failed: %s", esp_err_to_name(diag_ret));
+    }
+#else
+    // 临时关闭自动网络诊断：WiFi 稳定后不再默认跑 DNS/TCP/TLS，直接进入 ASR 测试。
+    ESP_LOGI(TAG, "Network diag disabled, start ASR test directly");
+#endif
+
+    // WiFi 已连接且稳定后启动 Mic/ASR 链路，ASR 内部会自己建立 WebSocket TLS。
+    // 这里不要使用 ESP_ERROR_CHECK：ASR/TLS 失败只打印错误，避免 abort 导致设备反复重启。
+    esp_err_t mic_ret = mic_adc_test_start();
+    if (mic_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Mic ADC/ASR start failed: %s", esp_err_to_name(mic_ret));
     }
 
     // WiFi 重连和 Mic ADC 采样都在后台任务中运行。
