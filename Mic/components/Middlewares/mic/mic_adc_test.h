@@ -25,14 +25,15 @@
 #define MIC_ADC_ERROR_RETRY_DELAY_MS  100  // 异常后短暂退避。
 #define MIC_ADC_TEST_TASK_STACK_SIZE  16384 // mic_adc_test 任务栈；ESP-IDF FreeRTOS 单位为字节。
 #define MIC_ADC_TASK_PRIORITY         4    // ADC 任务优先级。
-#define MIC_ADC_STACK_LOG_INTERVAL_MS 1000 // 栈剩余水位打印间隔，只允许 1 秒一次。
 #define MIC_ADC_ENABLE_LOOP_DEBUG_LOG 0    // 循环普通日志总开关，错误日志不受影响。
+#define MIC_ADC_ENABLE_STACK_DEBUG_LOG 0   // 任务栈水位诊断开关，WebSocket 已稳定后默认关闭。
 
 /* ASR 流式发送参数：只保留小预缓存和小实时块，避免 ASR 阶段占用整句 PCM 缓存。 */
 #define MIC_ADC_ASR_PRE_ROLL_MS        500  // VOICE_START 前保留 500 ms 句首 PCM。
 #define MIC_ADC_ASR_PRE_ROLL_MAX_MS    1000 // 预缓存上限，防止静态 RAM 误增。
 #define MIC_ADC_ASR_PRE_ROLL_SAMPLES   ((MIC_ADC_SAMPLE_FREQ_HZ * MIC_ADC_ASR_PRE_ROLL_MS) / 1000) // 预缓存样本数。
 #define MIC_ADC_ASR_LIVE_CHUNK_SAMPLES 160  // 实时发送块，160 samples = 10 ms PCM。
+#define MIC_ADC_ASR_SINGLE_SHOT_DEBUG   1    // 单次 ASR 调试模式：一轮 finish 后停在调试完成态，不再自动开始下一轮。
 
 #if MIC_ADC_ASR_PRE_ROLL_MS <= 0
 #error "MIC_ADC_ASR_PRE_ROLL_MS must be greater than 0"

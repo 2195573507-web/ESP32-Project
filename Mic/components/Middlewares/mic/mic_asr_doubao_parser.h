@@ -19,6 +19,8 @@
 #define MIC_ASR_DOUBAO_PARSER_HEADER_WORD_BYTES  4    // header size 单位，1 word = 4 字节。
 #define MIC_ASR_DOUBAO_PARSER_PAYLOAD_SIZE_BYTES 4    // payload size 固定 4 字节大端序。
 #define MIC_ASR_DOUBAO_PARSER_SEQUENCE_BYTES     4    // flags 带 sequence 时的序列号长度。
+#define MIC_ASR_DOUBAO_PARSER_ERROR_CODE_BYTES   4    // SERVER_ERROR error_code 固定 4 字节大端序。
+#define MIC_ASR_DOUBAO_PARSER_ERROR_SIZE_BYTES   4    // SERVER_ERROR error_message_size 固定 4 字节大端序。
 #define MIC_ASR_DOUBAO_PARSER_MIN_FRAME_BYTES    8    // 无 sequence 时最小帧长度。
 
 /* 第 1 字节：protocol version 和 header size。 */
@@ -50,13 +52,18 @@
 /* serialization：用于日志说明 payload 格式。 */
 #define MIC_ASR_DOUBAO_PARSER_SERIAL_NONE        0x0  // 无序列化。
 #define MIC_ASR_DOUBAO_PARSER_SERIAL_JSON        0x1  // JSON payload。
+#define MIC_ASR_DOUBAO_PARSER_SERIAL_PROTOBUF    0x2  // Protobuf payload；无 proto 描述时只能打印 wire 摘要和字符串片段。
 
-/* compression：第一版不做 gzip 解压，只识别并提示。 */
+/* compression：gzip 只在调试路径做 4KB 上限解压，不改变 ASR 会话和发送协议。 */
 #define MIC_ASR_DOUBAO_PARSER_COMPRESS_NONE      0x0  // 未压缩。
-#define MIC_ASR_DOUBAO_PARSER_COMPRESS_GZIP      0x1  // gzip 压缩，暂不解压。
+#define MIC_ASR_DOUBAO_PARSER_COMPRESS_GZIP      0x1  // gzip 压缩。
 
 /* 串口打印保护：payload 太长时只复制和打印前面一段，避免占用过多堆内存。 */
-#define MIC_ASR_DOUBAO_PARSER_MAX_PRINT_BYTES    2048 // 单次安全打印的最大 payload 字节数。
+#define MIC_ASR_DOUBAO_PARSER_MAX_PRINT_BYTES       2048 // 单次安全文本打印的最大 payload 字节数。
+#define MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG      0    // 服务端帧/payload 详细调试日志；默认关闭，SERVER_ERROR 仍会常显。
+#define MIC_ASR_DOUBAO_PARSER_HEX_PREVIEW_BYTES     256  // 服务端业务 payload 仅打印前 256 字节 hex。
+#define MIC_ASR_DOUBAO_PARSER_JSON_FIELD_MAX_CHARS  128  // JSON code/message/result/text 字段最多打印 128 字符。
+#define MIC_ASR_DOUBAO_PARSER_GZIP_MAX_OUTPUT_BYTES 4096 // gzip 调试解压最多输出 4KB，防止异常响应占用过多内存。
 
 /**
  * @brief 解析豆包 ASR 服务端 WebSocket binary payload。
@@ -68,7 +75,7 @@
  *
  * @param data WebSocket binary payload 指针，不能为空。
  * @param len WebSocket binary payload 长度。
- * @return 解析成功返回 ESP_OK；长度越界、参数无效、gzip 暂不支持或服务端错误返回错误码。
+ * @return 解析成功返回 ESP_OK；长度越界、参数无效或服务端错误返回错误码。
  */
 esp_err_t mic_asr_doubao_parser_parse(const uint8_t *data, size_t len);
 

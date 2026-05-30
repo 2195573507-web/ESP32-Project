@@ -42,11 +42,14 @@ static adc_continuous_data_t s_mic_adc_parsed_buffer[MIC_ADC_READ_BYTES / SOC_AD
  * - IDLE：未建立 ASR 会话，只允许把当前安静期 PCM 写入 pre-roll 环形缓存。
  * - STREAMING：VOICE_START 后 ASR start 成功，只允许在这个状态发送 pre-roll 和实时 PCM。
  * - FINISHING：VOICE_END 后立即进入，正在调用 finish/stop 收尾，禁止继续发送 pre-roll 和 PCM。
+ * - DEBUG_DONE：单次 ASR 调试模式下 finish 完成后进入，后续样本和 VAD 事件都忽略，
+ *   方便串口只保留一次完整协议收发日志，避免自动开始下一轮把关键响应冲掉。
  */
 typedef enum {
     MIC_ADC_ASR_STATE_IDLE = 0,    // 空闲态：只维护下一句话的句首预缓存。
     MIC_ADC_ASR_STATE_STREAMING,   // 流式态：当前 ASR 会话可接收 pre-roll 和 PCM。
     MIC_ADC_ASR_STATE_FINISHING,   // 收尾态：当前会话正在结束，新的音频样本全部丢弃。
+    MIC_ADC_ASR_STATE_DEBUG_DONE,  // 单次调试完成态：finish 后保持静默，不再启动新的 ASR 会话。
 } mic_adc_asr_state_t;
 
 /**
@@ -354,8 +357,10 @@ static void mic_adc_asr_stream_push_sample(mic_adc_asr_stream_t *stream, int16_t
  * @brief 在 VAD VOICE_END 时结束 ASR，并关闭 WebSocket。
  *
  * 调用方法：mic_adc_window_report() 检测到 MIC_VAD_EVENT_VOICE_END 后调用。
- * 函数一进入就把状态改为 FINISHING，因此 ADC 循环期间再来的样本不会继续发送
- * pre-roll 或 PCM。finish 完成后 stop 释放资源，最后清空本轮缓存并回到 IDLE。
+ * 函数先把 live_chunk 中不足 10 ms 的尾部 PCM 推入 mic_asr_doubao_send_pcm()；
+ * 随后进入 FINISHING，因此 ADC 循环期间再来的样本不会继续发送 pre-roll 或 PCM。
+ * finish() 会把 mic_asr_doubao 内部保留的最后一块真实 PCM 作为
+ * LAST_AUDIO_ONLY_REQUEST 发送，不再额外发 payload_size=0 的空包。
  *
  * @param stream ASR 流式状态，不能为空。
  */
@@ -365,17 +370,25 @@ static void mic_adc_asr_stream_finish(mic_adc_asr_stream_t *stream)
         return;
     }
 
+    esp_err_t ret = mic_adc_asr_stream_flush_live_chunk(stream);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ASR flush tail PCM failed: %s", esp_err_to_name(ret));
+    }
     stream->state = MIC_ADC_ASR_STATE_FINISHING;
-    stream->live_chunk_sample_count = 0;
 
     s_mic_asr_result_text[0] = '\0';
-    esp_err_t ret = mic_asr_doubao_finish(s_mic_asr_result_text, sizeof(s_mic_asr_result_text));
+    ret = mic_asr_doubao_finish(s_mic_asr_result_text, sizeof(s_mic_asr_result_text));
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ASR finish failed: %s", esp_err_to_name(ret));
     }
 
     mic_asr_doubao_stop();
+#if MIC_ADC_ASR_SINGLE_SHOT_DEBUG
+    ESP_LOGW(TAG, "ASR single-shot debug done, keep ASR idle until reboot");
+    stream->state = MIC_ADC_ASR_STATE_DEBUG_DONE;
+#else
     stream->state = MIC_ADC_ASR_STATE_IDLE;
+#endif
     stream->live_chunk_sample_count = 0;
     mic_adc_asr_stream_clear_pre_roll(stream);
 }
@@ -536,15 +549,17 @@ static void mic_adc_window_report(const mic_adc_window_t *window,
 /**
  * @brief 打印 mic_adc_test 任务栈剩余水位。
  *
- * 调用方法：任务启动后先打印一次；采集循环内由调用方按
- * MIC_ADC_STACK_LOG_INTERVAL_MS 节流，避免栈诊断日志本身变成高频 vfprintf 压力源。
+ * 调用方法：只有 MIC_ADC_ENABLE_STACK_DEBUG_LOG 打开时才会在任务启动后和采集循环中调用，
+ * 用于临时观察任务栈余量；正式 ASR 流程默认关闭，避免串口被诊断日志占用。
  */
+#if MIC_ADC_ENABLE_STACK_DEBUG_LOG
 static void mic_adc_log_stack_high_water_mark(void)
 {
     ESP_LOGI(TAG,
              "mic_adc_test uxTaskGetStackHighWaterMark: %u",
              (unsigned int)uxTaskGetStackHighWaterMark(NULL));
 }
+#endif
 
 /**
  * @brief 初始化 ADC continuous 驱动并绑定 Mic 所在的 ADC1_CH5。
@@ -612,7 +627,9 @@ static void mic_adc_test_task(void *arg)
     mic_adc_pcm_converter_t pcm_converter;
     mic_vad_t vad;
     mic_adc_asr_stream_t asr_stream;
+#if MIC_ADC_ENABLE_STACK_DEBUG_LOG
     TickType_t last_stack_log_tick = 0;
+#endif
 
     mic_adc_pcm_converter_init(&pcm_converter);
     mic_vad_init(&vad);
@@ -622,16 +639,21 @@ static void mic_adc_test_task(void *arg)
                             s_mic_asr_live_chunk_storage,
                             MIC_ADC_ASR_LIVE_CHUNK_SAMPLES);
     mic_adc_window_reset(&window);
-    ESP_LOGI(TAG, "mic_adc_test task started");
+    ESP_LOGI(TAG,
+             "mic_adc_test task started, ASR input is signed int16 little-endian PCM converted by mic_adc_pcm_convert_sample(), not raw ADC values");
+#if MIC_ADC_ENABLE_STACK_DEBUG_LOG
     mic_adc_log_stack_high_water_mark();
     last_stack_log_tick = xTaskGetTickCount();
+#endif
 
     while (1) {
+#if MIC_ADC_ENABLE_STACK_DEBUG_LOG
         TickType_t now = xTaskGetTickCount();
-        if ((now - last_stack_log_tick) >= pdMS_TO_TICKS(MIC_ADC_STACK_LOG_INTERVAL_MS)) {
+        if ((now - last_stack_log_tick) >= pdMS_TO_TICKS(1000)) {
             last_stack_log_tick = now;
             mic_adc_log_stack_high_water_mark();
         }
+#endif
 
         uint32_t read_bytes = 0;
         esp_err_t ret = adc_continuous_read(handle,
