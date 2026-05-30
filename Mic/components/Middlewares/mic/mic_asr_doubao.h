@@ -45,6 +45,11 @@
 #define MIC_ASR_DOUBAO_PACKET_SEND_DELAY_MS        MIC_ASR_DOUBAO_PACKET_MS // 每发一个 100 ms PCM 包后节流 100 ms，避免过快灌包。
 #define MIC_ASR_DOUBAO_RESPONSE_TIMEOUT_MS         15000 // last packet 后等待 result.text。
 #define MIC_ASR_DOUBAO_RESULT_TEXT_MAX_LEN         256   // result.text 输出缓冲区大小。
+#define MIC_ASR_DOUBAO_VAD_SPEECH_START_RMS        900   // 本地 RMS VAD：达到该 rms 认为开始说话。
+#define MIC_ASR_DOUBAO_VAD_SILENCE_END_RMS         650   // 本地 RMS VAD：低于该 rms 认为当前 100 ms 包是静音。
+#define MIC_ASR_DOUBAO_VAD_SILENCE_END_MS          1000  // IN_SPEECH 后连续静音达到 1000 ms 主动结束音频流。
+#define MIC_ASR_DOUBAO_VAD_MIN_RECORD_MS           800   // 最短录音时长；说话开始后未达到该时长不触发静音结束。
+#define MIC_ASR_DOUBAO_VAD_MAX_RECORD_MS           10000 // 最长录音时长；达到后主动发送 LAST_AUDIO_ONLY_REQUEST。
 #define MIC_ASR_DOUBAO_ENABLE_START_DEBUG_LOG      0     // 启动 URI/heap 诊断，调建连时改 1。
 #define MIC_ASR_DOUBAO_ENABLE_FRAME_DEBUG_LOG      0     // 旧版 WebSocket 粗粒度帧日志，保留给临时兼容；新的协议排查优先使用 MIC_ASR_DOUBAO_ENABLE_PROTOCOL_DEBUG_LOG。
 #define MIC_ASR_DOUBAO_ENABLE_RESULT_PRINT         0     // 旧版结果 ESP_LOG/printf；正常只看 ASR FINAL，调兼容路径时改 1。
@@ -101,6 +106,30 @@
 
 #if MIC_ASR_DOUBAO_PACKET_SEND_DELAY_MS < 0
 #error "MIC_ASR_DOUBAO_PACKET_SEND_DELAY_MS must not be negative"
+#endif
+
+#if MIC_ASR_DOUBAO_VAD_SPEECH_START_RMS <= 0
+#error "MIC_ASR_DOUBAO_VAD_SPEECH_START_RMS must be greater than 0"
+#endif
+
+#if MIC_ASR_DOUBAO_VAD_SILENCE_END_RMS < 0
+#error "MIC_ASR_DOUBAO_VAD_SILENCE_END_RMS must not be negative"
+#endif
+
+#if MIC_ASR_DOUBAO_VAD_SILENCE_END_MS <= 0
+#error "MIC_ASR_DOUBAO_VAD_SILENCE_END_MS must be greater than 0"
+#endif
+
+#if MIC_ASR_DOUBAO_VAD_MIN_RECORD_MS < 0
+#error "MIC_ASR_DOUBAO_VAD_MIN_RECORD_MS must not be negative"
+#endif
+
+#if MIC_ASR_DOUBAO_VAD_MAX_RECORD_MS <= 0
+#error "MIC_ASR_DOUBAO_VAD_MAX_RECORD_MS must be greater than 0"
+#endif
+
+#if MIC_ASR_DOUBAO_VAD_MAX_RECORD_MS < MIC_ASR_DOUBAO_VAD_MIN_RECORD_MS
+#error "MIC_ASR_DOUBAO_VAD_MAX_RECORD_MS must be greater than or equal to MIC_ASR_DOUBAO_VAD_MIN_RECORD_MS"
 #endif
 
 #if MIC_ASR_DOUBAO_PCM_SEND_HEX_PREVIEW_BYTES < 0

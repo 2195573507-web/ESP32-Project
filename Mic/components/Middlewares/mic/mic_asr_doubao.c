@@ -64,6 +64,18 @@ typedef struct {
 } mic_asr_doubao_final_key_t;
 
 /**
+ * @brief 本地 RMS 端点检测状态。
+ *
+ * 调用方法：每个 100 ms PCM 包发送前，根据当前包 pcm_rms 推进状态机。该状态机只决定
+ * 本地何时把当前包作为 LAST_AUDIO_ONLY_REQUEST 发送，不改变豆包协议字段和 PCM 数据。
+ */
+typedef enum {
+    MIC_ASR_DOUBAO_VAD_WAITING_FOR_SPEECH = 0,                     // 尚未检测到有效语音。
+    MIC_ASR_DOUBAO_VAD_IN_SPEECH,                                  // 已检测到说话，正在发送语音流。
+    MIC_ASR_DOUBAO_VAD_ENDING,                                     // 已决定结束，本地不再接受后续 PCM。
+} mic_asr_doubao_vad_state_t;
+
+/**
  * @brief 豆包 ASR 流式会话上下文。
  *
  * 调用方法：本文件内部使用一个静态上下文维护当前 ASR 会话。manual_ws_client_t
@@ -89,6 +101,11 @@ typedef struct {
     uint32_t sent_audio_packet_count;                              // 已成功发送的 PCM 音频业务包序号，从 1 开始递增。
     uint32_t pcm_quality_packet_count;                             // 本会话已经统计过的实际 PCM 音频包数量，不包含 0 字节 final 包。
     uint32_t pcm_quality_silence_streak;                           // 连续 p2p 很小的 PCM 包数量，用于判断长期接近静音。
+    mic_asr_doubao_vad_state_t vad_state;                          // 本地 RMS 端点检测状态。
+    bool local_audio_finished;                                      // true 表示已经发送 LAST_AUDIO_ONLY_REQUEST，后续不再发送 PCM。
+    uint32_t vad_audio_ms;                                         // 已发送/准备发送的本地音频时长，按 100 ms 包累计。
+    uint32_t vad_speech_ms;                                        // 从检测到说话开始累计的时长。
+    uint32_t vad_silence_ms;                                       // IN_SPEECH 后连续低 RMS 静音时长。
 
     uint8_t rx_frame_buffer[MANUAL_WS_MAX_PAYLOAD_SIZE];           // manual_ws_recv_frame() 的单帧 payload 缓冲。
     uint8_t *rx_message_buffer;                                    // WebSocket continuation 业务消息重组缓冲。
@@ -333,6 +350,11 @@ static void mic_asr_doubao_reset_session_state(void)
     s_asr.sent_audio_packet_count = 0;
     s_asr.pcm_quality_packet_count = 0;
     s_asr.pcm_quality_silence_streak = 0;
+    s_asr.vad_state = MIC_ASR_DOUBAO_VAD_WAITING_FOR_SPEECH;
+    s_asr.local_audio_finished = false;
+    s_asr.vad_audio_ms = 0;
+    s_asr.vad_speech_ms = 0;
+    s_asr.vad_silence_ms = 0;
     s_asr.rx_ws_frame_count = 0;
     s_asr.final_history_next = 0;
     s_asr.connect_id[0] = '\0';
@@ -623,7 +645,6 @@ static void mic_asr_doubao_log_protocol_header(const char *direction,
  * @param value 要开平方的无符号整数。
  * @return floor(sqrt(value))。
  */
-#if MIC_ASR_DOUBAO_ENABLE_PCM_QUALITY_LOG
 static uint32_t mic_asr_doubao_isqrt_u64(uint64_t value)
 {
     uint64_t result = 0;
@@ -645,7 +666,33 @@ static uint32_t mic_asr_doubao_isqrt_u64(uint64_t value)
 
     return (uint32_t)result;
 }
-#endif
+
+/**
+ * @brief 计算一个 PCM_s16le 包的 RMS。
+ *
+ * 调用方法：每次发送 100 ms AUDIO_ONLY_REQUEST 前调用，用于本地端点检测。函数只读
+ * 当前待发送 PCM，不改变 PCM 内容、不参与豆包协议封包；payload 必须是 signed int16
+ * little-endian PCM。
+ *
+ * @param pcm_payload 当前 100 ms PCM 包。
+ * @param payload_bytes PCM 字节数，必须是 int16_t 的整数倍。
+ * @return 当前包 pcm_rms；参数非法时返回 0。
+ */
+static uint32_t mic_asr_doubao_calc_pcm_rms(const int16_t *pcm_payload, size_t payload_bytes)
+{
+    if (pcm_payload == NULL || payload_bytes == 0 || (payload_bytes % sizeof(int16_t)) != 0) {
+        return 0;
+    }
+
+    size_t sample_count = payload_bytes / sizeof(int16_t);
+    uint64_t sum_square_samples = 0;
+    for (size_t i = 0; i < sample_count; i++) {
+        int32_t sample = pcm_payload[i];
+        sum_square_samples += (uint64_t)(sample * sample);
+    }
+
+    return mic_asr_doubao_isqrt_u64(sum_square_samples / sample_count);
+}
 
 /**
  * @brief 判断当前 PCM 包是否需要打印质量统计。
@@ -777,6 +824,85 @@ static void mic_asr_doubao_log_pcm_packet_quality(const int16_t *pcm_payload,
     (void)payload_bytes;
     (void)packet_index;
 #endif
+}
+
+/**
+ * @brief 用当前 100 ms PCM 包推进本地 RMS VAD 状态机。
+ *
+ * 调用方法：mic_asr_doubao_flush_pending_audio() 在真正发送当前包前调用。返回 true
+ * 表示当前包应作为 LAST_AUDIO_ONLY_REQUEST 发送，随后本地音频发送循环停止；返回 false
+ * 表示继续按普通 AUDIO_ONLY_REQUEST 发送。状态机只依赖当前包 pcm_rms 和已累计包时长：
+ * WAITING_FOR_SPEECH -> IN_SPEECH -> ENDING。
+ *
+ * @param packet_index 当前将要发送的音频业务包序号。
+ * @param sequence_abs 当前包对应的正 sequence；若结束，将取负数发送。
+ * @param pcm_rms 当前包 RMS。
+ * @return 当前包是否应作为 LAST_AUDIO_ONLY_REQUEST 发送。
+ */
+static bool mic_asr_doubao_update_local_vad(uint32_t packet_index,
+                                            int32_t sequence_abs,
+                                            uint32_t pcm_rms)
+{
+    if (s_asr.local_audio_finished || s_asr.vad_state == MIC_ASR_DOUBAO_VAD_ENDING) {
+        return true;
+    }
+
+    s_asr.vad_audio_ms += MIC_ASR_DOUBAO_PACKET_MS;
+
+    if (s_asr.vad_audio_ms >= MIC_ASR_DOUBAO_VAD_MAX_RECORD_MS) {
+        s_asr.vad_state = MIC_ASR_DOUBAO_VAD_ENDING;
+        ESP_LOGI(TAG,
+                 "ASR VAD: max_record_ms reached, sending LAST_AUDIO_ONLY_REQUEST packet=%" PRIu32 ", sequence=%" PRId32,
+                 packet_index,
+                 -sequence_abs);
+        return true;
+    }
+
+    switch (s_asr.vad_state) {
+    case MIC_ASR_DOUBAO_VAD_WAITING_FOR_SPEECH:
+        if (pcm_rms >= MIC_ASR_DOUBAO_VAD_SPEECH_START_RMS) {
+            s_asr.vad_state = MIC_ASR_DOUBAO_VAD_IN_SPEECH;
+            s_asr.vad_speech_ms = MIC_ASR_DOUBAO_PACKET_MS;
+            s_asr.vad_silence_ms = 0;
+            ESP_LOGI(TAG,
+                     "ASR VAD: speech started at packet=%" PRIu32 ", rms=%" PRIu32,
+                     packet_index,
+                     pcm_rms);
+        }
+        break;
+
+    case MIC_ASR_DOUBAO_VAD_IN_SPEECH:
+        s_asr.vad_speech_ms += MIC_ASR_DOUBAO_PACKET_MS;
+        if (pcm_rms < MIC_ASR_DOUBAO_VAD_SILENCE_END_RMS) {
+            s_asr.vad_silence_ms += MIC_ASR_DOUBAO_PACKET_MS;
+            ESP_LOGI(TAG,
+                     "ASR VAD: silence_ms=%" PRIu32 ", rms=%" PRIu32,
+                     s_asr.vad_silence_ms,
+                     pcm_rms);
+        } else {
+            s_asr.vad_silence_ms = 0;
+        }
+
+        if (s_asr.vad_speech_ms >= MIC_ASR_DOUBAO_VAD_MIN_RECORD_MS &&
+            s_asr.vad_silence_ms >= MIC_ASR_DOUBAO_VAD_SILENCE_END_MS) {
+            s_asr.vad_state = MIC_ASR_DOUBAO_VAD_ENDING;
+            ESP_LOGI(TAG,
+                     "ASR VAD: speech ended, sending LAST_AUDIO_ONLY_REQUEST packet=%" PRIu32 ", sequence=%" PRId32,
+                     packet_index,
+                     -sequence_abs);
+            return true;
+        }
+        break;
+
+    case MIC_ASR_DOUBAO_VAD_ENDING:
+        return true;
+
+    default:
+        s_asr.vad_state = MIC_ASR_DOUBAO_VAD_WAITING_FOR_SPEECH;
+        break;
+    }
+
+    return false;
 }
 
 /**
@@ -1090,6 +1216,9 @@ static void mic_asr_doubao_log_audio_format(void)
  * 调用方法：send_pcm() 中已有一个完整 100 ms 包且新 PCM 到来时，先把旧包作为普通
  * AUDIO_ONLY_REQUEST 发出；finish() 把当前保留的真实 PCM 作为 LAST_AUDIO_ONLY_REQUEST
  * 发出。函数绝不发送 payload_size=0 的空最后包。
+ * 若本地 RMS VAD 判断当前包已经到达端点，即使调用方传入 is_last=false，也会把当前
+ * 真实 PCM 包改为 LAST_AUDIO_ONLY_REQUEST 发送，并设置 local_audio_finished，后续
+ * mic_asr_doubao_send_pcm() 不再继续发送新音频。
  *
  * sequence 计算方法：packet_id 仍按音频业务包从 1 开始计数，但豆包服务端的
  * autoAssignedSequence 在 FULL_CLIENT_REQUEST/首个 FULL_SERVER_RESPONSE 后已经推进到 2，
@@ -1098,6 +1227,11 @@ static void mic_asr_doubao_log_audio_format(void)
  */
 static esp_err_t mic_asr_doubao_flush_pending_audio(bool is_last)
 {
+    if (s_asr.local_audio_finished) {
+        s_asr.pending_audio_bytes = 0;
+        return ESP_OK;
+    }
+
     size_t payload_bytes = s_asr.pending_audio_bytes;
     if (payload_bytes == 0) {
         ESP_LOGW(TAG, "ASR no pending PCM payload, skip empty last audio packet");
@@ -1111,8 +1245,13 @@ static esp_err_t mic_asr_doubao_flush_pending_audio(bool is_last)
         return ESP_ERR_INVALID_SIZE;
     }
     int32_t sequence_abs = (int32_t)sequence_abs_u32;
-    int32_t sequence = is_last ? -sequence_abs : sequence_abs;
-    uint8_t send_flags = is_last ?
+    uint32_t pcm_rms = mic_asr_doubao_calc_pcm_rms(payload, payload_bytes);
+    bool local_vad_last = !is_last && mic_asr_doubao_update_local_vad(packet_index,
+                                                                      sequence_abs,
+                                                                      pcm_rms);
+    bool send_as_last = is_last || local_vad_last;
+    int32_t sequence = send_as_last ? -sequence_abs : sequence_abs;
+    uint8_t send_flags = send_as_last ?
         MIC_ASR_DOUBAO_PARSER_FLAG_NEG_SEQUENCE :
         MIC_ASR_DOUBAO_PARSER_FLAG_POS_SEQUENCE;
 #if !MIC_ASR_DOUBAO_DEBUG_PCM_SEND_SIZE
@@ -1130,11 +1269,15 @@ static esp_err_t mic_asr_doubao_flush_pending_audio(bool is_last)
              (unsigned int)payload_bytes);
 #endif
 
-    esp_err_t ret = mic_asr_doubao_send_audio_frame(payload, payload_bytes, sequence, is_last);
+    esp_err_t ret = mic_asr_doubao_send_audio_frame(payload, payload_bytes, sequence, send_as_last);
     if (ret == ESP_OK) {
         s_asr.sent_audio_packet_count = packet_index;
         s_asr.pcm_quality_packet_count = packet_index;
         s_asr.sent_audio_bytes += payload_bytes;
+        if (send_as_last) {
+            s_asr.local_audio_finished = true;
+            s_asr.vad_state = MIC_ASR_DOUBAO_VAD_ENDING;
+        }
 #if MIC_ASR_DOUBAO_DEBUG_PCM_SEND_SIZE
         ESP_LOGI(TAG,
                  "ASR PCM send packet_id=%" PRIu32 ", sequence=%" PRId32 ", flags=0x%X, payload_bytes=%u, total_sent_bytes=%u",
@@ -1786,6 +1929,14 @@ esp_err_t mic_asr_doubao_send_pcm(const int16_t *pcm, size_t bytes)
     if (!s_asr.session_ready || s_asr.ws.tls == NULL || !s_asr.ws.connected) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (s_asr.local_audio_finished) {
+        esp_err_t ret = mic_asr_doubao_poll_server_once(MIC_ASR_DOUBAO_SEND_POLL_TIMEOUT_MS);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "ASR poll server after local VAD end failed: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        return ESP_OK;
+    }
 
     const uint8_t *pcm_bytes = (const uint8_t *)pcm;
     size_t offset = 0;
@@ -1797,6 +1948,9 @@ esp_err_t mic_asr_doubao_send_pcm(const int16_t *pcm, size_t bytes)
             }
             if (s_asr.connection_broken || s_asr.response_error) {
                 return ESP_FAIL;
+            }
+            if (s_asr.local_audio_finished) {
+                return ESP_OK;
             }
         }
 
@@ -1829,10 +1983,13 @@ esp_err_t mic_asr_doubao_finish(char *text_buf, size_t text_buf_size)
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t ret = mic_asr_doubao_flush_pending_audio(true);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "send last audio packet failed: %s", esp_err_to_name(ret));
-        return ret;
+    esp_err_t ret = ESP_OK;
+    if (!s_asr.local_audio_finished) {
+        ret = mic_asr_doubao_flush_pending_audio(true);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "send last audio packet failed: %s", esp_err_to_name(ret));
+            return ret;
+        }
     }
 #if MIC_ASR_DOUBAO_ENABLE_FRAME_DEBUG_LOG
     ESP_LOGI(TAG, "ASR audio sent: %u bytes", (unsigned int)s_asr.sent_audio_bytes);
