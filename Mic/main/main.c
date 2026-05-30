@@ -4,7 +4,9 @@
 #include "esp_err.h"
 #include "esp_log.h"
 
+#include "mic_asr_llm_bridge.h"
 #include "mic_adc_test.h"
+#include "mic_llm_doubao.h"
 #include "wifi_manager.h"
 
 /* 日志标签：只在本文件使用，不作为调试参数。 */
@@ -44,6 +46,20 @@ void app_main(void)
     while (!wifi_is_stable()) {
         ESP_LOGI(TAG, "Waiting for stable WiFi before Mic/ASR start");
         vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    /*
+     * WiFi 稳定后先初始化 LLM 和 ASR->LLM 桥接任务。LLM 初始化失败只关闭下游
+     * LLM 闭环，不影响 Mic/ASR 继续工作，避免 API Key 或 URL 配置错误导致录音链路崩溃。
+     */
+    esp_err_t llm_ret = mic_llm_doubao_init();
+    if (llm_ret == ESP_OK) {
+        esp_err_t bridge_ret = mic_asr_llm_bridge_start();
+        if (bridge_ret != ESP_OK) {
+            ESP_LOGE(TAG, "ASR->LLM bridge start failed: %s", esp_err_to_name(bridge_ret));
+        }
+    } else {
+        ESP_LOGE(TAG, "Mic LLM init failed, ASR->LLM bridge disabled: %s", esp_err_to_name(llm_ret));
     }
 
     // WiFi 已连接且稳定后启动 Mic/ASR 链路，ASR 内部会自己建立 WebSocket TLS。

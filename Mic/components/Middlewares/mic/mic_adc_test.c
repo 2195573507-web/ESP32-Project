@@ -41,15 +41,13 @@ static adc_continuous_data_t s_mic_adc_parsed_buffer[MIC_ADC_READ_BYTES / SOC_AD
  * 状态含义：
  * - IDLE：未建立 ASR 会话，只允许把当前安静期 PCM 写入 pre-roll 环形缓存。
  * - STREAMING：VOICE_START 后 ASR start 成功，只允许在这个状态发送 pre-roll 和实时 PCM。
- * - FINISHING：VOICE_END 后立即进入，正在调用 finish/stop 收尾，禁止继续发送 pre-roll 和 PCM。
- * - DEBUG_DONE：单次 ASR 调试模式下 finish 完成后进入，后续样本和 VAD 事件都忽略，
- *   方便串口只保留一次完整协议收发日志，避免自动开始下一轮把关键响应冲掉。
+ * - FINISHING：外层 VAD VOICE_END 或豆包 final 后立即进入，正在调用 finish/stop
+ *   收尾，禁止继续发送 pre-roll 和 PCM。
  */
 typedef enum {
     MIC_ADC_ASR_STATE_IDLE = 0,    // 空闲态：只维护下一句话的句首预缓存。
     MIC_ADC_ASR_STATE_STREAMING,   // 流式态：当前 ASR 会话可接收 pre-roll 和 PCM。
     MIC_ADC_ASR_STATE_FINISHING,   // 收尾态：当前会话正在结束，新的音频样本全部丢弃。
-    MIC_ADC_ASR_STATE_DEBUG_DONE,  // 单次调试完成态：finish 后保持静默，不再启动新的 ASR 会话。
 } mic_adc_asr_state_t;
 
 /**
@@ -68,6 +66,8 @@ typedef struct {
     size_t live_chunk_capacity_samples;// live_chunk_samples 可容纳的样本数。
     size_t live_chunk_sample_count;   // 当前 live_chunk 中已累计的样本数。
     mic_adc_asr_state_t state;        // ASR 会话三态；只有 STREAMING 允许向豆包发送音频。
+    TickType_t next_start_tick;        // ASR 启动失败后的退避截止 tick，避免断网时频繁重连。
+    bool waiting_log_printed;          // 控制 ASR LOOP: waiting for speech 只在进入等待态时打印一次。
 } mic_adc_asr_stream_t;
 
 /**
@@ -152,6 +152,9 @@ static void mic_adc_asr_stream_init(mic_adc_asr_stream_t *stream,
     stream->live_chunk_capacity_samples = live_chunk_capacity_samples;
     stream->live_chunk_sample_count = 0;
     stream->state = MIC_ADC_ASR_STATE_IDLE;
+    stream->next_start_tick = 0;
+    stream->waiting_log_printed = true;
+    ESP_LOGI(TAG, "ASR LOOP: waiting for speech");
 }
 
 /**
@@ -197,6 +200,75 @@ static void mic_adc_asr_stream_clear_pre_roll(mic_adc_asr_stream_t *stream)
 
     stream->pre_roll_sample_count = 0;
     stream->pre_roll_write_index = 0;
+}
+
+/**
+ * @brief ASR session 启动失败后的退避。
+ *
+ * 调用方法：WiFi 未稳定、WebSocket 建连失败或发送 pre-roll 失败后调用。这里只记录
+ * 下一次允许启动的 tick，不阻塞 ADC 采样任务；后续 VOICE_START 到来时再判断是否
+ * 已经过了 MIC_ADC_ASR_RETRY_DELAY_MS，避免断网时疯狂重连。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ */
+static void mic_adc_asr_stream_delay_next_start(mic_adc_asr_stream_t *stream)
+{
+    if (stream == NULL) {
+        return;
+    }
+
+    stream->next_start_tick = xTaskGetTickCount() + pdMS_TO_TICKS(MIC_ADC_ASR_RETRY_DELAY_MS);
+}
+
+/**
+ * @brief 判断当前是否允许启动新一轮 ASR session。
+ *
+ * 调用方法：mic_adc_asr_stream_activate() 在真正调用 mic_asr_doubao_start() 前调用。
+ * 返回 false 表示仍处于失败退避期，本次 VOICE_START 不启动网络 session。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ * @return 允许启动返回 true；仍需等待返回 false。
+ */
+static bool mic_adc_asr_stream_can_start(mic_adc_asr_stream_t *stream)
+{
+    if (stream == NULL || stream->next_start_tick == 0) {
+        return true;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if ((int32_t)(now - stream->next_start_tick) < 0) {
+        return false;
+    }
+
+    stream->next_start_tick = 0;
+    return true;
+}
+
+/**
+ * @brief 结束本轮 ASR session 后回到等待下一次说话。
+ *
+ * 调用方法：finish 成功/失败、发送失败或 pre-roll 失败后调用。函数只重置 Mic ASR
+ * 流式状态和小缓存；豆包 WebSocket/TLS 资源由调用方先调用 mic_asr_doubao_stop()
+ * 释放，从而确保下一轮 session 会重新建立连接、重置 sequence/packet_id/final 去重。
+ *
+ * @param stream ASR 流式状态，不能为空。
+ * @param log_session_done true 时打印 session done 日志。
+ */
+static void mic_adc_asr_stream_enter_waiting(mic_adc_asr_stream_t *stream, bool log_session_done)
+{
+    if (stream == NULL) {
+        return;
+    }
+
+    stream->state = MIC_ADC_ASR_STATE_IDLE;
+    stream->live_chunk_sample_count = 0;
+    mic_adc_asr_stream_clear_pre_roll(stream);
+    if (log_session_done) {
+        ESP_LOGI(TAG, "ASR LOOP: session done, waiting for next speech");
+    } else if (!stream->waiting_log_printed) {
+        ESP_LOGI(TAG, "ASR LOOP: waiting for speech");
+    }
+    stream->waiting_log_printed = true;
 }
 
 /**
@@ -256,13 +328,24 @@ static bool mic_adc_asr_stream_activate(mic_adc_asr_stream_t *stream)
     if (stream->state != MIC_ADC_ASR_STATE_IDLE) {
         return false;
     }
+    if (!mic_adc_asr_stream_can_start(stream)) {
+        return false;
+    }
+    if (!wifi_is_connected() || !wifi_is_stable()) {
+        ESP_LOGW(TAG, "ASR LOOP: WiFi is not connected/stable, skip session start");
+        mic_adc_asr_stream_delay_next_start(stream);
+        stream->live_chunk_sample_count = 0;
+        mic_adc_asr_stream_clear_pre_roll(stream);
+        return false;
+    }
 
+    ESP_LOGI(TAG, "ASR LOOP: speech detected, starting session");
+    stream->waiting_log_printed = false;
     esp_err_t ret = mic_asr_doubao_start();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ASR start failed: %s", esp_err_to_name(ret));
-        stream->state = MIC_ADC_ASR_STATE_IDLE;
-        stream->live_chunk_sample_count = 0;
-        mic_adc_asr_stream_clear_pre_roll(stream);
+        mic_adc_asr_stream_delay_next_start(stream);
+        mic_adc_asr_stream_enter_waiting(stream, false);
         return false;
     }
 
@@ -272,9 +355,8 @@ static bool mic_adc_asr_stream_activate(mic_adc_asr_stream_t *stream)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ASR send pre-roll failed: %s", esp_err_to_name(ret));
         mic_asr_doubao_stop();
-        stream->state = MIC_ADC_ASR_STATE_IDLE;
-        stream->live_chunk_sample_count = 0;
-        mic_adc_asr_stream_clear_pre_roll(stream);
+        mic_adc_asr_stream_delay_next_start(stream);
+        mic_adc_asr_stream_enter_waiting(stream, false);
         return false;
     }
 
@@ -347,16 +429,16 @@ static void mic_adc_asr_stream_push_sample(mic_adc_asr_stream_t *stream, int16_t
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ASR send PCM failed: %s", esp_err_to_name(ret));
         mic_asr_doubao_stop();
-        stream->state = MIC_ADC_ASR_STATE_IDLE;
-        stream->live_chunk_sample_count = 0;
-        mic_adc_asr_stream_clear_pre_roll(stream);
+        mic_adc_asr_stream_delay_next_start(stream);
+        mic_adc_asr_stream_enter_waiting(stream, true);
     }
 }
 
 /**
  * @brief 在 VAD VOICE_END 时结束 ASR，并关闭 WebSocket。
  *
- * 调用方法：mic_adc_window_report() 检测到 MIC_VAD_EVENT_VOICE_END 后调用。
+ * 调用方法：mic_adc_window_report() 检测到 MIC_VAD_EVENT_VOICE_END，或豆包本地 RMS
+ * VAD 已提前发送 LAST_AUDIO_ONLY_REQUEST 并收到 final 后调用。
  * 函数先把 live_chunk 中不足 10 ms 的尾部 PCM 推入 mic_asr_doubao_send_pcm()；
  * 随后进入 FINISHING，因此 ADC 循环期间再来的样本不会继续发送 pre-roll 或 PCM。
  * finish() 会把 mic_asr_doubao 内部保留的最后一块真实 PCM 作为
@@ -370,27 +452,30 @@ static void mic_adc_asr_stream_finish(mic_adc_asr_stream_t *stream)
         return;
     }
 
-    esp_err_t ret = mic_adc_asr_stream_flush_live_chunk(stream);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "ASR flush tail PCM failed: %s", esp_err_to_name(ret));
+    esp_err_t ret = ESP_OK;
+    bool already_has_final = mic_asr_doubao_session_has_final();
+    if (!already_has_final) {
+        ret = mic_adc_asr_stream_flush_live_chunk(stream);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "ASR flush tail PCM failed: %s", esp_err_to_name(ret));
+        }
     }
     stream->state = MIC_ADC_ASR_STATE_FINISHING;
 
     s_mic_asr_result_text[0] = '\0';
     ret = mic_asr_doubao_finish(s_mic_asr_result_text, sizeof(s_mic_asr_result_text));
-    if (ret != ESP_OK) {
+    if (ret == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "ASR LOOP: session no result, waiting for next speech");
+    } else if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ASR finish failed: %s", esp_err_to_name(ret));
+        mic_adc_asr_stream_delay_next_start(stream);
+    }
+    if (s_mic_asr_result_text[0] != '\0') {
+        ESP_LOGI(TAG, "ASR LOOP: session final text=\"%s\"", s_mic_asr_result_text);
     }
 
     mic_asr_doubao_stop();
-#if MIC_ADC_ASR_SINGLE_SHOT_DEBUG
-    ESP_LOGW(TAG, "ASR single-shot debug done, keep ASR idle until reboot");
-    stream->state = MIC_ADC_ASR_STATE_DEBUG_DONE;
-#else
-    stream->state = MIC_ADC_ASR_STATE_IDLE;
-#endif
-    stream->live_chunk_sample_count = 0;
-    mic_adc_asr_stream_clear_pre_roll(stream);
+    mic_adc_asr_stream_enter_waiting(stream, true);
 }
 
 /**
@@ -515,6 +600,13 @@ static void mic_adc_window_report(const mic_adc_window_t *window,
         return;
     }
 
+    if (asr_stream->state == MIC_ADC_ASR_STATE_STREAMING &&
+        mic_asr_doubao_session_has_final()) {
+        mic_adc_asr_stream_finish(asr_stream);
+        mic_vad_init(vad);
+        return;
+    }
+
     uint32_t adc_rms = mic_adc_calc_ac_rms(window->count,
                                            (int64_t)window->sum_raw,
                                            window->sum_square_raw);
@@ -543,6 +635,7 @@ static void mic_adc_window_report(const mic_adc_window_t *window,
     } else if (vad_event == MIC_VAD_EVENT_VOICE_END) {
         // 句尾只发送剩余 live_chunk 和 last audio packet，随后关闭 WebSocket。
         mic_adc_asr_stream_finish(asr_stream);
+        mic_vad_init(vad);
     }
 }
 

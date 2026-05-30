@@ -7,6 +7,7 @@
 
 #include "esp_err.h"
 #include "esp_tls.h"
+#include "app_debug_config.h"
 
 /**
  * @file manual_ws.h
@@ -22,7 +23,7 @@
 #define MANUAL_WS_IO_BUF_SIZE             512                                   // 握手分片读取临时缓冲。
 #define MANUAL_WS_MAX_PAYLOAD_SIZE        4096                                  // 单帧 payload 上限，过大返回 ESP_ERR_INVALID_SIZE。
 #define MANUAL_WS_DEFAULT_TIMEOUT_MS      15000                                 // TLS 建连和默认读写超时。
-#define MANUAL_WS_ENABLE_DEBUG_LOG        0                                     // 详细日志开关，调协议时改 1。
+#define MANUAL_WS_ENABLE_DEBUG_LOG        APP_DEBUG_MANUAL_WS_FRAME_LOG         // 详细日志开关，调协议时改 1。
 
 /* WebSocket 握手常量：Sec-WebSocket-Key 为 16 字节随机数的 24 字符 Base64。 */
 #define MANUAL_WS_SEC_KEY_BASE64_LEN      24                                    // 不含结尾 NUL。

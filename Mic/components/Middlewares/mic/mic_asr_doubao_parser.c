@@ -46,7 +46,7 @@ static bool mic_asr_doubao_parser_has_sequence(uint8_t flags)
  * 调用方法：日志打印时调用，便于串口确认当前收到的是 SERVER_ACK、
  * FULL_SERVER_RESPONSE 还是 SERVER_ERROR。
  */
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_HEADER_LOG
 static const char *mic_asr_doubao_parser_message_type_name(uint8_t message_type)
 {
     switch (message_type) {
@@ -68,7 +68,7 @@ static const char *mic_asr_doubao_parser_message_type_name(uint8_t message_type)
  * 调用方法：日志打印时调用。第一版主要期望 JSON，也允许把未知类型按原始文本
  * 安全打印，便于观察服务端实际返回。
  */
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_HEADER_LOG || MIC_ASR_DOUBAO_PARSER_ENABLE_SERVER_ERROR_DETAIL_LOG
 static const char *mic_asr_doubao_parser_serialization_name(uint8_t serialization)
 {
     switch (serialization) {
@@ -93,7 +93,7 @@ static const char *mic_asr_doubao_parser_serialization_name(uint8_t serializatio
  */
 static void mic_asr_doubao_parser_print_hex_preview(const uint8_t *payload, size_t payload_len)
 {
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_HEX_LOG
     if (payload == NULL || payload_len == 0) {
         ESP_LOGI(TAG, "Doubao ASR payload hex: <empty>");
         return;
@@ -139,7 +139,7 @@ static void mic_asr_doubao_parser_print_hex_preview(const uint8_t *payload, size
  */
 static void mic_asr_doubao_parser_print_frame_hex_prefix(const uint8_t *frame, size_t frame_len)
 {
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_SERVER_ERROR_DETAIL_LOG
     if (frame == NULL || frame_len == 0) {
         ESP_LOGI(TAG, "Doubao ASR frame hex prefix: <empty>");
         return;
@@ -181,7 +181,7 @@ static void mic_asr_doubao_parser_print_frame_hex_prefix(const uint8_t *frame, s
  *
  * 调用方法：日志打印时调用。gzip 第一版只提示不解压，避免把压缩数据当字符串。
  */
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_HEADER_LOG || MIC_ASR_DOUBAO_PARSER_ENABLE_SERVER_ERROR_DETAIL_LOG
 static const char *mic_asr_doubao_parser_compression_name(uint8_t compression)
 {
     switch (compression) {
@@ -204,7 +204,7 @@ static const char *mic_asr_doubao_parser_compression_name(uint8_t compression)
  */
 static esp_err_t mic_asr_doubao_parser_print_payload(const uint8_t *payload, size_t payload_len)
 {
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_TEXT_LOG
     if (payload_len == 0) {
         ESP_LOGI(TAG, "Doubao ASR payload: <empty>");
         return ESP_OK;
@@ -254,7 +254,7 @@ static esp_err_t mic_asr_doubao_parser_print_payload(const uint8_t *payload, siz
  * 调用方法：解析服务端 JSON payload 后打印 error/code/message/result/text。每个字段最多
  * 打印 MIC_ASR_DOUBAO_PARSER_JSON_FIELD_MAX_CHARS 个字符，避免长文本或异常堆栈刷屏。
  */
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_TEXT_LOG
 static void mic_asr_doubao_parser_log_json_string_field(const char *name, const cJSON *item)
 {
     if (name == NULL || !cJSON_IsString(item) || item->valuestring == NULL) {
@@ -279,7 +279,7 @@ static void mic_asr_doubao_parser_log_json_string_field(const char *name, const 
  */
 static void mic_asr_doubao_parser_log_json_summary(const uint8_t *payload, size_t payload_len)
 {
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_TEXT_LOG
     if (payload == NULL || payload_len == 0) {
         ESP_LOGI(TAG, "Doubao ASR JSON summary: <empty>");
         return;
@@ -354,7 +354,7 @@ static void mic_asr_doubao_parser_log_json_summary(const uint8_t *payload, size_
  */
 static void mic_asr_doubao_parser_log_protobuf_summary(const uint8_t *payload, size_t payload_len)
 {
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_TEXT_LOG
     if (payload == NULL || payload_len == 0) {
         ESP_LOGI(TAG, "Doubao ASR protobuf summary: <empty>");
         return;
@@ -410,7 +410,7 @@ static void mic_asr_doubao_parser_log_payload_summary(uint8_t serialization,
  * @param out_deflate_len 输出 deflate 数据长度。
  * @return gzip 头合法且能定位 deflate 数据返回 true，否则返回 false。
  */
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_TEXT_LOG
 static bool mic_asr_doubao_parser_locate_gzip_deflate(const uint8_t *payload,
                                                       size_t payload_len,
                                                       const uint8_t **out_deflate,
@@ -500,7 +500,7 @@ static void mic_asr_doubao_parser_log_gzip_summary(uint8_t serialization,
                                                    const uint8_t *payload,
                                                    size_t payload_len)
 {
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_TEXT_LOG
     bool looks_gzip = payload != NULL &&
                       payload_len >= 2 &&
                       payload[0] == 0x1F &&
@@ -623,7 +623,7 @@ static esp_err_t mic_asr_doubao_parser_parse_server_error(const uint8_t *data,
              "Doubao ASR SERVER_ERROR: error_code=%" PRIu32 ", error_message_size=%" PRIu32,
              error_code,
              error_message_size);
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_SERVER_ERROR_DETAIL_LOG
     ESP_LOGE(TAG,
              "Doubao ASR SERVER_ERROR detail: version=%u header=%u flags=0x%X serialization=0x%X(%s) compression=0x%X(%s)",
              (unsigned int)version,
@@ -750,7 +750,7 @@ static esp_err_t mic_asr_doubao_parser_parse_one(const uint8_t *data,
         return ESP_ERR_INVALID_SIZE;
     }
 
-#if MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG
+#if MIC_ASR_DOUBAO_PARSER_ENABLE_HEADER_LOG
     ESP_LOGI(TAG,
              "Doubao ASR frame: version=%u header=%u type=0x%X(%s) flags=0x%X sequence=%s%d serialization=0x%X(%s) compression=0x%X(%s) payload=%" PRIu32,
              (unsigned int)version,

@@ -1,10 +1,12 @@
 #ifndef MIC_ASR_DOUBAO_H
 #define MIC_ASR_DOUBAO_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "app_debug_config.h"
 
 /**
  * @file mic_asr_doubao.h
@@ -32,7 +34,7 @@
 #define MIC_ASR_DOUBAO_SAMPLE_RATE           16000                                                  // PCM 采样率：16 kHz。
 #define MIC_ASR_DOUBAO_BITS                  16                                                     // PCM 位深：int16。
 #define MIC_ASR_DOUBAO_CHANNELS              1                                                      // 单声道。
-#define MIC_ASR_DOUBAO_PACKET_MS             100                                                    // 每包音频 100 ms。
+#define MIC_ASR_DOUBAO_PACKET_MS             APP_ASR_AUDIO_PACKET_MS                                // 每包音频 100 ms。
 #define MIC_ASR_DOUBAO_BYTES_PER_SAMPLE      (MIC_ASR_DOUBAO_BITS / 8)                              // int16 PCM 每样本 2 字节。
 #define MIC_ASR_DOUBAO_PACKET_BYTES          ((MIC_ASR_DOUBAO_SAMPLE_RATE * MIC_ASR_DOUBAO_CHANNELS * MIC_ASR_DOUBAO_BYTES_PER_SAMPLE * MIC_ASR_DOUBAO_PACKET_MS) / 1000) // 16 kHz/16 bit/mono 下 100 ms = 3200 字节。
 #define MIC_ASR_DOUBAO_FIRST_AUDIO_SEQUENCE  2                                                      // FULL_CLIENT_REQUEST/服务端首个响应占用 sequence=1，首个 AUDIO_ONLY_REQUEST 必须从 2 开始。
@@ -45,31 +47,36 @@
 #define MIC_ASR_DOUBAO_PACKET_SEND_DELAY_MS        MIC_ASR_DOUBAO_PACKET_MS // 每发一个 100 ms PCM 包后节流 100 ms，避免过快灌包。
 #define MIC_ASR_DOUBAO_RESPONSE_TIMEOUT_MS         15000 // last packet 后等待 result.text。
 #define MIC_ASR_DOUBAO_RESULT_TEXT_MAX_LEN         256   // result.text 输出缓冲区大小。
-#define MIC_ASR_DOUBAO_VAD_SPEECH_START_RMS        900   // 本地 RMS VAD：达到该 rms 认为开始说话。
-#define MIC_ASR_DOUBAO_VAD_SILENCE_END_RMS         650   // 本地 RMS VAD：低于该 rms 认为当前 100 ms 包是静音。
-#define MIC_ASR_DOUBAO_VAD_SILENCE_END_MS          1000  // IN_SPEECH 后连续静音达到 1000 ms 主动结束音频流。
-#define MIC_ASR_DOUBAO_VAD_MIN_RECORD_MS           800   // 最短录音时长；说话开始后未达到该时长不触发静音结束。
-#define MIC_ASR_DOUBAO_VAD_MAX_RECORD_MS           10000 // 最长录音时长；达到后主动发送 LAST_AUDIO_ONLY_REQUEST。
-#define MIC_ASR_DOUBAO_ENABLE_START_DEBUG_LOG      0     // 启动 URI/heap 诊断，调建连时改 1。
-#define MIC_ASR_DOUBAO_ENABLE_FRAME_DEBUG_LOG      0     // 旧版 WebSocket 粗粒度帧日志，保留给临时兼容；新的协议排查优先使用 MIC_ASR_DOUBAO_ENABLE_PROTOCOL_DEBUG_LOG。
-#define MIC_ASR_DOUBAO_ENABLE_RESULT_PRINT         0     // 旧版结果 ESP_LOG/printf；正常只看 ASR FINAL，调兼容路径时改 1。
-#define MIC_ASR_DOUBAO_ENABLE_INTERIM_LOG          1     // interim 文本变化时打印 ASR INTERIM；不会触发下游 LLM。
-#define MIC_ASR_DOUBAO_ENABLE_RESULT_JSON_DEBUG_LOG 0    // 打印服务端 duration/result.text 摘要；默认关闭，避免 streaming 重复刷屏。
-#define MIC_ASR_DOUBAO_ENABLE_PCM_QUALITY_LOG      0     // PCM 质量统计日志；需要排查音频质量时改 1。
-#define MIC_ASR_DOUBAO_DEBUG_PCM_SEND_SIZE         0     // PCM 发包尺寸/sequence 日志；需要排查协议 sequence 时改 1。
-#define MIC_ASR_DOUBAO_PCM_SEND_HEX_PREVIEW_BYTES  16    // 每个音频包打印前 16 个 PCM 字节，用于确认不是 ADC raw。
-#define MIC_ASR_DOUBAO_PCM_QUALITY_LOG_EVERY_PACKET 0    // 1 表示每包打印 pcm_min/pcm_max/pcm_rms；0 表示按间隔打印。
+#define MIC_ASR_DOUBAO_VAD_SPEECH_START_RMS        APP_ASR_VAD_SPEECH_START_RMS // 本地 RMS VAD：达到该 rms 认为开始说话。
+#define MIC_ASR_DOUBAO_VAD_SILENCE_END_RMS         APP_ASR_VAD_SPEECH_END_RMS   // 本地 RMS VAD：低于该 rms 认为当前 100 ms 包是静音。
+#define MIC_ASR_DOUBAO_VAD_SILENCE_END_MS          APP_ASR_VAD_SILENCE_END_MS   // IN_SPEECH 后累计静音达到 800 ms 主动结束音频流。
+#define MIC_ASR_DOUBAO_VAD_MIN_RECORD_MS           APP_ASR_VAD_MIN_RECORD_MS    // 最短录音时长；说话开始后未达到该时长不触发静音结束。
+#define MIC_ASR_DOUBAO_VAD_MAX_RECORD_MS           APP_ASR_VAD_MAX_RECORD_MS    // 最长录音时长；达到后主动发送 LAST_AUDIO_ONLY_REQUEST。
+#define MIC_ASR_DOUBAO_ENABLE_START_DEBUG_LOG       APP_DEBUG_ASR_START_DIAG_LOG          // 启动 URI/heap 诊断，调建连时改 app_debug_config.h。
+#define MIC_ASR_DOUBAO_ENABLE_FRAME_DEBUG_LOG       APP_DEBUG_ASR_WS_FRAME_LOG            // 旧版 WebSocket 粗粒度帧日志，调协议时改 app_debug_config.h。
+#define MIC_ASR_DOUBAO_ENABLE_RESULT_PRINT          APP_DEBUG_ASR_LEGACY_RESULT_PRINT     // 旧版结果 ESP_LOG/printf；正常只看 ASR FINAL。
+#define MIC_ASR_DOUBAO_ENABLE_INTERIM_LOG           APP_DEBUG_ASR_INTERIM_LOG             // interim 文本变化时打印 ASR INTERIM；不会触发下游 LLM。
+#define MIC_ASR_DOUBAO_ENABLE_RESULT_JSON_DEBUG_LOG APP_DEBUG_ASR_RESULT_JSON_SUMMARY_LOG // 打印服务端 duration/result.text 摘要，默认关闭。
+#define MIC_ASR_DOUBAO_ENABLE_PCM_QUALITY_LOG       APP_DEBUG_ASR_PCM_PACKET_STATS_LOG    // PCM 质量统计日志；需要排查音频质量时打开。
+#define MIC_ASR_DOUBAO_DEBUG_PCM_SEND_SIZE          APP_DEBUG_ASR_PCM_SEND_SIZE_LOG       // PCM 发包尺寸/sequence 日志；需要排查 sequence 时打开。
+#define MIC_ASR_DOUBAO_ENABLE_PCM_SEND_HEX_DUMP     APP_DEBUG_ASR_PCM_HEX_DUMP            // 每个音频包前 N 字节 PCM hex，默认关闭。
+#define MIC_ASR_DOUBAO_PCM_SEND_HEX_PREVIEW_BYTES   APP_DEBUG_ASR_PCM_HEX_PREVIEW_BYTES   // PCM hex 预览字节数。
+#define MIC_ASR_DOUBAO_PCM_QUALITY_LOG_EVERY_PACKET APP_DEBUG_ASR_PCM_EVERY_PACKET_STATS  // 1 表示每包打印 pcm_min/pcm_max/pcm_rms；0 表示按间隔打印。
+#define MIC_ASR_DOUBAO_ENABLE_VAD_STATE_LOG         APP_DEBUG_ASR_VAD_STATE_LOG           // silence_ms 等连续 VAD 状态日志，默认关闭。
 
 /* ASR 协议级诊断参数：只打印协议头、服务端响应摘要和有限 hex，不打印 PCM 原始内容。 */
-#define MIC_ASR_DOUBAO_ENABLE_PROTOCOL_DEBUG_LOG      0   // 豆包业务二进制协议诊断总开关；默认关闭，错误日志不受影响。
-#define MIC_ASR_DOUBAO_SERVER_PAYLOAD_HEX_PREVIEW_BYTES 256 // 服务端 payload 仅打印前 256 字节 hex，避免串口刷屏和误打大块二进制。
+#define MIC_ASR_DOUBAO_ENABLE_PROTOCOL_DEBUG_LOG       APP_DEBUG_ASR_PROTOCOL_HEADER_LOG       // 豆包业务二进制协议头诊断；错误日志不受影响。
+#define MIC_ASR_DOUBAO_ENABLE_PROTOCOL_PREFIX_DUMP     APP_DEBUG_ASR_PROTOCOL_PREFIX_DUMP      // 业务帧 prefix hex dump，高噪声默认关闭。
+#define MIC_ASR_DOUBAO_SERVER_PAYLOAD_HEX_PREVIEW_BYTES APP_DEBUG_ASR_PAYLOAD_HEX_PREVIEW_BYTES // 服务端 payload hex 预览字节数。
+#define MIC_ASR_DOUBAO_ENABLE_WS_PAYLOAD_HEX_DUMP      APP_DEBUG_ASR_WS_PAYLOAD_HEX_DUMP       // ASR 层 WebSocket payload hex dump，高噪声默认关闭。
+#define MIC_ASR_DOUBAO_WS_PAYLOAD_HEX_PREVIEW_BYTES    APP_DEBUG_ASR_WS_PAYLOAD_HEX_PREVIEW_BYTES // WebSocket payload hex 预览字节数。
 
 /* ASR 结果处理参数：只影响日志去重和占位回调，不改变底层 WebSocket/PCM 协议。 */
 #define MIC_ASR_DOUBAO_LOG_ID_MAX_LEN                 64  // ASR FINAL 日志中 log_id 的最大保存长度。
 #define MIC_ASR_DOUBAO_FINAL_DEDUP_HISTORY            8   // 最近 N 条 final utterance 去重，按 log_id/start/end/text 匹配。
 
 /* PCM 质量统计参数：只影响日志判断，不改变 WebSocket 发送协议和音频数据。 */
-#define MIC_ASR_DOUBAO_PCM_QUALITY_LOG_INTERVAL_PACKETS   20 // 每 20 个实际发送的 PCM 包打印一次质量统计，避免串口刷屏。
+#define MIC_ASR_DOUBAO_PCM_QUALITY_LOG_INTERVAL_PACKETS   APP_DEBUG_ASR_PCM_STATS_INTERVAL_PACKETS // 每 N 个实际发送的 PCM 包打印一次质量统计。
 #define MIC_ASR_DOUBAO_PCM_SILENCE_P2P_THRESHOLD          96 // p2p 小于该值时认为当前包可能接近静音。
 #define MIC_ASR_DOUBAO_PCM_SILENCE_WARN_CONSECUTIVE       5  // 连续 5 个低 p2p 包后提示可能接近静音。
 #define MIC_ASR_DOUBAO_PCM_CLIP_NEAR_MIN                  (-32000) // 接近 int16_t 下限的削波判断阈值。
@@ -191,6 +198,17 @@ esp_err_t mic_asr_doubao_send_pcm(const int16_t *pcm, size_t bytes);
  * @return 成功返回 ESP_OK；空识别文本也属于业务成功，超时或服务端错误返回错误码。
  */
 esp_err_t mic_asr_doubao_finish(char *text_buf, size_t text_buf_size);
+
+/**
+ * @brief 查询当前 ASR 会话是否已经完成 final。
+ *
+ * 调用方法：Mic 采集任务在流式发送 PCM 后调用。若本地 RMS VAD 已经发送
+ * LAST_AUDIO_ONLY_REQUEST，且服务端已经返回 final 文本，则上层可以立即结束本轮
+ * session 并回到等待下一次说话，不必继续等待外层 VAD 的 VOICE_END。
+ *
+ * @return 当前会话已收到 final 且没有服务端错误时返回 true。
+ */
+bool mic_asr_doubao_session_has_final(void);
 
 /**
  * @brief ASR final 文本占位回调。

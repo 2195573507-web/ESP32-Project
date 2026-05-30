@@ -34,7 +34,6 @@ enum {
     MIC_ASR_DOUBAO_CONNECT_ID_MAX_LEN = 48,
     MIC_ASR_DOUBAO_HEADERS_MAX_LEN = 384,
     MIC_ASR_DOUBAO_JSON_MAX_LEN = 256,
-    MIC_ASR_DOUBAO_WS_PAYLOAD_HEX_PREVIEW_BYTES = 32,
     MIC_ASR_DOUBAO_RX_MESSAGE_MAX_BYTES = MANUAL_WS_MAX_PAYLOAD_SIZE,
 };
 
@@ -87,11 +86,14 @@ typedef struct {
     bool response_done;                                            // true 表示已得到最终结果或服务端 close。
     bool response_error;                                           // true 表示服务端返回错误或帧/协议异常。
     bool connection_broken;                                        // true 表示发送/接收已失败；后续不再发送 last 包或 close frame。
+    bool final_received;                                           // true 表示服务端 FINAL 已到，当前 session 立即停止发送音频。
+    bool last_audio_sent;                                          // true 表示本 session 已发送过 LAST_AUDIO_ONLY_REQUEST。
+    bool server_closed;                                            // true 表示 manual_ws 已收到服务端 close frame。
 
     char connect_id[MIC_ASR_DOUBAO_CONNECT_ID_MAX_LEN];            // 本次握手的 X-Api-Connect-Id。
     char headers[MIC_ASR_DOUBAO_HEADERS_MAX_LEN];                  // 只保存豆包 X-Api-* 业务 Header。
-    char recognized_text[MIC_ASR_DOUBAO_RESULT_TEXT_MAX_LEN];      // 最新识别文本。
-    char interim_text[MIC_ASR_DOUBAO_RESULT_TEXT_MAX_LEN];         // 最近一次已打印的 interim 文本，用于变化去重。
+    char final_text[MIC_ASR_DOUBAO_RESULT_TEXT_MAX_LEN];           // 本轮 FINAL 文本，含 close-before-final 的 interim fallback。
+    char last_interim_text[MIC_ASR_DOUBAO_RESULT_TEXT_MAX_LEN];    // 最近一次 interim 文本，用于变化去重和 close fallback。
     mic_asr_doubao_final_key_t final_history[MIC_ASR_DOUBAO_FINAL_DEDUP_HISTORY]; // 最近 final 输出历史。
     size_t final_history_next;                                     // final_history 的环形写入位置。
 
@@ -102,7 +104,6 @@ typedef struct {
     uint32_t pcm_quality_packet_count;                             // 本会话已经统计过的实际 PCM 音频包数量，不包含 0 字节 final 包。
     uint32_t pcm_quality_silence_streak;                           // 连续 p2p 很小的 PCM 包数量，用于判断长期接近静音。
     mic_asr_doubao_vad_state_t vad_state;                          // 本地 RMS 端点检测状态。
-    bool local_audio_finished;                                      // true 表示已经发送 LAST_AUDIO_ONLY_REQUEST，后续不再发送 PCM。
     uint32_t vad_audio_ms;                                         // 已发送/准备发送的本地音频时长，按 100 ms 包累计。
     uint32_t vad_speech_ms;                                        // 从检测到说话开始累计的时长。
     uint32_t vad_silence_ms;                                       // IN_SPEECH 后连续低 RMS 静音时长。
@@ -333,6 +334,49 @@ static void mic_asr_doubao_mark_connection_broken(const char *reason)
 }
 
 /**
+ * @brief 收到 FINAL 后立即关闭当前 ASR 会话的音频发送侧。
+ *
+ * 调用方法：服务端 definite=true 文本首次确认时调用。此后 send_pcm()/finish()
+ * 都不会再发送 AUDIO_ONLY_REQUEST 或 LAST_AUDIO_ONLY_REQUEST；上层可直接读取
+ * final_text 并进入下一轮等待说话。
+ */
+static void mic_asr_doubao_stop_audio_after_final(void)
+{
+    s_asr.final_received = true;
+    s_asr.response_done = true;
+    s_asr.pending_audio_bytes = 0;
+    s_asr.vad_state = MIC_ASR_DOUBAO_VAD_ENDING;
+}
+
+/**
+ * @brief 服务端 close frame 到达时按 ASR 业务状态收敛本轮结果。
+ *
+ * 调用方法：mic_asr_doubao_handle_ws_frame() 收到 WebSocket close opcode 后调用。
+ * close frame 本身不是链路错误：FINAL 已经到达时直接成功；没有 FINAL 但有 interim
+ * 时把最后一次 interim 当作 fallback final；完全没有文本时返回 ESP_ERR_NOT_FOUND
+ * 表示本轮无识别内容。
+ */
+static esp_err_t mic_asr_doubao_handle_server_close(void)
+{
+    s_asr.server_closed = true;
+    s_asr.response_done = true;
+
+    if (s_asr.final_received) {
+        ESP_LOGI(TAG, "ASR session closed normally after final result");
+        return ESP_OK;
+    }
+
+    if (s_asr.last_interim_text[0] != '\0') {
+        strlcpy(s_asr.final_text, s_asr.last_interim_text, sizeof(s_asr.final_text));
+        ESP_LOGW(TAG, "ASR server closed before final, use last interim as final");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "ASR server closed before final and no interim text");
+    return ESP_ERR_NOT_FOUND;
+}
+
+/**
  * @brief 清空不需要跨会话保留的状态。
  *
  * 调用方法：start 前和 stop 后调用。ws 连接必须先由 manual_ws_close() 释放。
@@ -345,13 +389,15 @@ static void mic_asr_doubao_reset_session_state(void)
     s_asr.response_done = false;
     s_asr.response_error = false;
     s_asr.connection_broken = false;
+    s_asr.final_received = false;
+    s_asr.last_audio_sent = false;
+    s_asr.server_closed = false;
     s_asr.pending_audio_bytes = 0;
     s_asr.sent_audio_bytes = 0;
     s_asr.sent_audio_packet_count = 0;
     s_asr.pcm_quality_packet_count = 0;
     s_asr.pcm_quality_silence_streak = 0;
     s_asr.vad_state = MIC_ASR_DOUBAO_VAD_WAITING_FOR_SPEECH;
-    s_asr.local_audio_finished = false;
     s_asr.vad_audio_ms = 0;
     s_asr.vad_speech_ms = 0;
     s_asr.vad_silence_ms = 0;
@@ -359,8 +405,8 @@ static void mic_asr_doubao_reset_session_state(void)
     s_asr.final_history_next = 0;
     s_asr.connect_id[0] = '\0';
     s_asr.headers[0] = '\0';
-    s_asr.recognized_text[0] = '\0';
-    s_asr.interim_text[0] = '\0';
+    s_asr.final_text[0] = '\0';
+    s_asr.last_interim_text[0] = '\0';
     memset(s_asr.final_history, 0, sizeof(s_asr.final_history));
 }
 
@@ -495,7 +541,7 @@ static const char *mic_asr_doubao_compression_name(uint8_t compression)
  * 字节；发送端只打印豆包 4 字节协议头，不打印 PCM 内容。函数使用固定栈缓冲，
  * 不保存整句音频，也不会把 payload 当字符串直接输出。
  */
-#if MIC_ASR_DOUBAO_ENABLE_PROTOCOL_DEBUG_LOG
+#if MIC_ASR_DOUBAO_ENABLE_PROTOCOL_PREFIX_DUMP
 static void mic_asr_doubao_log_hex_preview(const char *label,
                                            const uint8_t *data,
                                            size_t data_len,
@@ -843,7 +889,8 @@ static bool mic_asr_doubao_update_local_vad(uint32_t packet_index,
                                             int32_t sequence_abs,
                                             uint32_t pcm_rms)
 {
-    if (s_asr.local_audio_finished || s_asr.vad_state == MIC_ASR_DOUBAO_VAD_ENDING) {
+    if (s_asr.final_received || s_asr.last_audio_sent ||
+        s_asr.vad_state == MIC_ASR_DOUBAO_VAD_ENDING) {
         return true;
     }
 
@@ -875,10 +922,14 @@ static bool mic_asr_doubao_update_local_vad(uint32_t packet_index,
         s_asr.vad_speech_ms += MIC_ASR_DOUBAO_PACKET_MS;
         if (pcm_rms < MIC_ASR_DOUBAO_VAD_SILENCE_END_RMS) {
             s_asr.vad_silence_ms += MIC_ASR_DOUBAO_PACKET_MS;
+#if MIC_ASR_DOUBAO_ENABLE_VAD_STATE_LOG
             ESP_LOGI(TAG,
                      "ASR VAD: silence_ms=%" PRIu32 ", rms=%" PRIu32,
                      s_asr.vad_silence_ms,
                      pcm_rms);
+#endif
+        } else if (s_asr.vad_silence_ms > MIC_ASR_DOUBAO_PACKET_MS) {
+            s_asr.vad_silence_ms -= MIC_ASR_DOUBAO_PACKET_MS;
         } else {
             s_asr.vad_silence_ms = 0;
         }
@@ -917,16 +968,21 @@ static void mic_asr_doubao_log_audio_send_debug(const int16_t *pcm_payload,
                                                 int32_t sequence,
                                                 uint8_t flags)
 {
-#if MIC_ASR_DOUBAO_ENABLE_PROTOCOL_DEBUG_LOG
+#if MIC_ASR_DOUBAO_ENABLE_PROTOCOL_DEBUG_LOG || MIC_ASR_DOUBAO_ENABLE_PCM_SEND_HEX_DUMP
     if (pcm_payload == NULL || payload_bytes == 0) {
         ESP_LOGI(TAG,
+#if MIC_ASR_DOUBAO_ENABLE_PCM_SEND_HEX_DUMP
                  "ASR AUDIO_ONLY debug: sequence=%" PRId32 ", flags=0x%X, payload_size=%u, pcm_first_hex=<empty>",
+#else
+                 "ASR AUDIO_ONLY debug: sequence=%" PRId32 ", flags=0x%X, payload_size=%u",
+#endif
                  sequence,
                  (unsigned int)flags,
                  (unsigned int)payload_bytes);
         return;
     }
 
+#if MIC_ASR_DOUBAO_ENABLE_PCM_SEND_HEX_DUMP
     size_t preview_len = payload_bytes;
     if (preview_len > MIC_ASR_DOUBAO_PCM_SEND_HEX_PREVIEW_BYTES) {
         preview_len = MIC_ASR_DOUBAO_PCM_SEND_HEX_PREVIEW_BYTES;
@@ -955,6 +1011,13 @@ static void mic_asr_doubao_log_audio_send_debug(const int16_t *pcm_payload,
              (unsigned int)preview_len,
              hex,
              payload_bytes > preview_len ? " ..." : "");
+#else
+    ESP_LOGI(TAG,
+             "ASR AUDIO_ONLY debug: sequence=%" PRId32 ", flags=0x%X, payload_size=%u",
+             sequence,
+             (unsigned int)flags,
+             (unsigned int)payload_bytes);
+#endif
 #else
     (void)pcm_payload;
     (void)payload_bytes;
@@ -991,7 +1054,7 @@ static const char *mic_asr_doubao_ws_opcode_name(uint8_t opcode)
 }
 #endif
 
-#if MIC_ASR_DOUBAO_ENABLE_FRAME_DEBUG_LOG
+#if MIC_ASR_DOUBAO_ENABLE_WS_PAYLOAD_HEX_DUMP
 /**
  * @brief 打印 payload 前 32 字节十六进制预览。
  *
@@ -1073,13 +1136,15 @@ static esp_err_t mic_asr_doubao_send_current_frame(const char *send_label, size_
 
 #if MIC_ASR_DOUBAO_ENABLE_PROTOCOL_DEBUG_LOG
     mic_asr_doubao_log_protocol_header(send_label, s_asr.frame_buffer, frame_len);
+#else
+    (void)send_label;
+#endif
+#if MIC_ASR_DOUBAO_ENABLE_PROTOCOL_PREFIX_DUMP
     mic_asr_doubao_log_hex_preview("ASR SEND protocol_prefix",
                                    s_asr.frame_buffer,
                                    frame_len < MIC_ASR_DOUBAO_AUDIO_REQUEST_PREFIX_BYTES ?
                                    frame_len : MIC_ASR_DOUBAO_AUDIO_REQUEST_PREFIX_BYTES,
                                    MIC_ASR_DOUBAO_AUDIO_REQUEST_PREFIX_BYTES);
-#else
-    (void)send_label;
 #endif
 #if MIC_ASR_DOUBAO_ENABLE_FRAME_DEBUG_LOG
     ESP_LOGI(TAG,
@@ -1087,6 +1152,8 @@ static esp_err_t mic_asr_doubao_send_current_frame(const char *send_label, size_
              MANUAL_WS_OPCODE_BINARY,
              mic_asr_doubao_ws_opcode_name(MANUAL_WS_OPCODE_BINARY),
              (unsigned int)frame_len);
+#endif
+#if MIC_ASR_DOUBAO_ENABLE_WS_PAYLOAD_HEX_DUMP
     mic_asr_doubao_log_payload_hex_preview("ASR WS SEND", s_asr.frame_buffer, frame_len);
 #endif
 
@@ -1211,13 +1278,35 @@ static void mic_asr_doubao_log_audio_format(void)
 }
 
 /**
+ * @brief 把当前 session final_text 拷贝给调用方并保留旧版可选输出。
+ *
+ * 调用方法：finish() 判定本轮识别成功后调用。final_text 可来自服务端 FINAL，
+ * 也可来自 close-before-final 的 last_interim_text fallback。
+ */
+static esp_err_t mic_asr_doubao_copy_final_text(char *text_buf, size_t text_buf_size)
+{
+    if (text_buf != NULL && text_buf_size > 0) {
+        strlcpy(text_buf, s_asr.final_text, text_buf_size);
+    }
+#if MIC_ASR_DOUBAO_ENABLE_RESULT_PRINT
+    ESP_LOGI(TAG, "ASR result: %s", s_asr.final_text);
+    printf("ASR result: %s\n", s_asr.final_text);
+    fflush(stdout);
+#else
+    (void)text_buf;
+    (void)text_buf_size;
+#endif
+    return ESP_OK;
+}
+
+/**
  * @brief 发送当前累计的音频 payload。
  *
  * 调用方法：send_pcm() 中已有一个完整 100 ms 包且新 PCM 到来时，先把旧包作为普通
  * AUDIO_ONLY_REQUEST 发出；finish() 把当前保留的真实 PCM 作为 LAST_AUDIO_ONLY_REQUEST
  * 发出。函数绝不发送 payload_size=0 的空最后包。
  * 若本地 RMS VAD 判断当前包已经到达端点，即使调用方传入 is_last=false，也会把当前
- * 真实 PCM 包改为 LAST_AUDIO_ONLY_REQUEST 发送，并设置 local_audio_finished，后续
+ * 真实 PCM 包改为 LAST_AUDIO_ONLY_REQUEST 发送，并设置 last_audio_sent，后续
  * mic_asr_doubao_send_pcm() 不再继续发送新音频。
  *
  * sequence 计算方法：packet_id 仍按音频业务包从 1 开始计数，但豆包服务端的
@@ -1227,7 +1316,11 @@ static void mic_asr_doubao_log_audio_format(void)
  */
 static esp_err_t mic_asr_doubao_flush_pending_audio(bool is_last)
 {
-    if (s_asr.local_audio_finished) {
+    if (s_asr.final_received) {
+        s_asr.pending_audio_bytes = 0;
+        return ESP_OK;
+    }
+    if (s_asr.last_audio_sent) {
         s_asr.pending_audio_bytes = 0;
         return ESP_OK;
     }
@@ -1275,7 +1368,7 @@ static esp_err_t mic_asr_doubao_flush_pending_audio(bool is_last)
         s_asr.pcm_quality_packet_count = packet_index;
         s_asr.sent_audio_bytes += payload_bytes;
         if (send_as_last) {
-            s_asr.local_audio_finished = true;
+            s_asr.last_audio_sent = true;
             s_asr.vad_state = MIC_ASR_DOUBAO_VAD_ENDING;
         }
 #if MIC_ASR_DOUBAO_DEBUG_PCM_SEND_SIZE
@@ -1396,16 +1489,16 @@ static void mic_asr_doubao_remember_final(const char *log_id,
  * 调用方法：utterance.definite=false 且文本/时间有效时调用。interim 只用于提示，
  * 仅在文本变化时打印 ASR INTERIM，绝不触发 mic_asr_on_final_text() 或下游 LLM。
  */
-static void mic_asr_doubao_handle_interim_text(const char *text)
+static void mic_asr_doubao_handle_last_interim_text(const char *text)
 {
     if (text == NULL || text[0] == '\0') {
         return;
     }
-    if (strcmp(s_asr.interim_text, text) == 0) {
+    if (strcmp(s_asr.last_interim_text, text) == 0) {
         return;
     }
 
-    strlcpy(s_asr.interim_text, text, sizeof(s_asr.interim_text));
+    strlcpy(s_asr.last_interim_text, text, sizeof(s_asr.last_interim_text));
 #if MIC_ASR_DOUBAO_ENABLE_INTERIM_LOG
     ESP_LOGI(TAG, "ASR INTERIM: text=\"%s\"", text);
 #endif
@@ -1415,7 +1508,7 @@ static void mic_asr_doubao_handle_interim_text(const char *text)
  * @brief 处理 final ASR 文本。
  *
  * 调用方法：utterance.definite=true 且文本/时间有效时调用。函数会先按
- * log_id/start/end/text 去重；首次出现时打印干净的 ASR FINAL，保存 recognized_text，
+ * log_id/start/end/text 去重；首次出现时打印干净的 ASR FINAL，保存 final_text，
  * 设置 response_done，并调用 mic_asr_on_final_text() 占位回调。
  */
 static void mic_asr_doubao_handle_final_text(const char *log_id,
@@ -1433,15 +1526,15 @@ static void mic_asr_doubao_handle_final_text(const char *log_id,
     }
 
     mic_asr_doubao_remember_final(safe_log_id, start_time, end_time, text);
-    strlcpy(s_asr.recognized_text, text, sizeof(s_asr.recognized_text));
-    s_asr.response_done = true;
+    strlcpy(s_asr.final_text, text, sizeof(s_asr.final_text));
+    mic_asr_doubao_stop_audio_after_final();
     ESP_LOGI(TAG,
              "ASR FINAL: text=\"%s\", start=%" PRId32 ", end=%" PRId32 ", log_id=%s",
              text,
              start_time,
              end_time,
              safe_log_id[0] != '\0' ? safe_log_id : "<empty>");
-    mic_asr_on_final_text(s_asr.recognized_text);
+    mic_asr_on_final_text(s_asr.final_text);
 }
 
 /**
@@ -1492,7 +1585,7 @@ static bool mic_asr_doubao_handle_utterances(const cJSON *root, const cJSON *res
                                              end_time,
                                              text_item->valuestring);
         } else {
-            mic_asr_doubao_handle_interim_text(text_item->valuestring);
+            mic_asr_doubao_handle_last_interim_text(text_item->valuestring);
         }
     }
 
@@ -1517,10 +1610,7 @@ static void mic_asr_doubao_handle_legacy_text_fallback(const cJSON *root, const 
     if (cJSON_IsString(text_item) &&
         text_item->valuestring != NULL &&
         text_item->valuestring[0] != '\0') {
-        strlcpy(s_asr.recognized_text,
-                text_item->valuestring,
-                sizeof(s_asr.recognized_text));
-        mic_asr_doubao_handle_interim_text(text_item->valuestring);
+        mic_asr_doubao_handle_last_interim_text(text_item->valuestring);
     }
 }
 
@@ -1578,16 +1668,16 @@ static void mic_asr_doubao_extract_result_text(const char *json_payload, size_t 
         ESP_LOGI(TAG,
                  "ASR server result: duration=%d, result.text=%s",
                  duration->valueint,
-                 s_asr.recognized_text[0] != '\0' ? s_asr.recognized_text : "<empty>");
+                 s_asr.last_interim_text[0] != '\0' ? s_asr.last_interim_text : "<empty>");
     } else if (cJSON_IsString(duration) && duration->valuestring != NULL) {
         ESP_LOGI(TAG,
                  "ASR server result: duration=%s, result.text=%s",
                  duration->valuestring,
-                 s_asr.recognized_text[0] != '\0' ? s_asr.recognized_text : "<empty>");
+                 s_asr.last_interim_text[0] != '\0' ? s_asr.last_interim_text : "<empty>");
     } else {
         ESP_LOGI(TAG,
                  "ASR server result: duration=<missing>, result.text=%s",
-                 s_asr.recognized_text[0] != '\0' ? s_asr.recognized_text : "<empty>");
+                 s_asr.last_interim_text[0] != '\0' ? s_asr.last_interim_text : "<empty>");
     }
 #else
     (void)duration;
@@ -1764,13 +1854,13 @@ static esp_err_t mic_asr_doubao_handle_ws_frame(const manual_ws_frame_t *frame)
              mic_asr_doubao_ws_opcode_name(frame->opcode),
              (unsigned int)frame->payload_len,
              frame->masked);
+#endif
+#if MIC_ASR_DOUBAO_ENABLE_WS_PAYLOAD_HEX_DUMP
     mic_asr_doubao_log_payload_hex_preview("ASR WS RECV", frame->payload, frame->payload_len);
 #endif
 
     if (frame->opcode == MANUAL_WS_OPCODE_CLOSE) {
-        ESP_LOGE(TAG, "ASR WS server close frame");
-        mic_asr_doubao_mark_connection_broken("server sent close frame");
-        return ESP_OK;
+        return mic_asr_doubao_handle_server_close();
     }
 
     if (frame->opcode == MANUAL_WS_OPCODE_PING ||
@@ -1851,6 +1941,9 @@ static esp_err_t mic_asr_doubao_poll_server_once(int timeout_ms)
     }
 
     ret = mic_asr_doubao_handle_ws_frame(&frame);
+    if (ret == ESP_ERR_NOT_FOUND) {
+        return ret;
+    }
     if (ret != ESP_OK) {
         mic_asr_doubao_mark_connection_broken("handle server frame failed while polling");
         return ret;
@@ -1906,6 +1999,11 @@ esp_err_t mic_asr_doubao_start(void)
 
     s_asr.session_ready = true;
     ret = mic_asr_doubao_poll_server_once(MIC_ASR_DOUBAO_POST_FULL_RECV_TIMEOUT_MS);
+    if (ret == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "ASR server closed before audio and returned no content");
+        mic_asr_doubao_stop();
+        return ret;
+    }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ASR server returned error after full client request: %s", esp_err_to_name(ret));
         mic_asr_doubao_stop();
@@ -1926,16 +2024,25 @@ esp_err_t mic_asr_doubao_send_pcm(const int16_t *pcm, size_t bytes)
         ESP_LOGW(TAG, "ASR connection is broken or has server error, stop sending PCM");
         return ESP_FAIL;
     }
-    if (!s_asr.session_ready || s_asr.ws.tls == NULL || !s_asr.ws.connected) {
-        return ESP_ERR_INVALID_STATE;
+    if (s_asr.final_received) {
+        return ESP_OK;
     }
-    if (s_asr.local_audio_finished) {
+    if (s_asr.response_done) {
+        return s_asr.final_text[0] != '\0' ? ESP_OK : ESP_ERR_NOT_FOUND;
+    }
+    if (s_asr.last_audio_sent) {
+        if (s_asr.response_done || s_asr.ws.tls == NULL || !s_asr.ws.connected) {
+            return ESP_OK;
+        }
         esp_err_t ret = mic_asr_doubao_poll_server_once(MIC_ASR_DOUBAO_SEND_POLL_TIMEOUT_MS);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "ASR poll server after local VAD end failed: %s", esp_err_to_name(ret));
             return ret;
         }
         return ESP_OK;
+    }
+    if (!s_asr.session_ready || s_asr.ws.tls == NULL || !s_asr.ws.connected) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     const uint8_t *pcm_bytes = (const uint8_t *)pcm;
@@ -1949,7 +2056,13 @@ esp_err_t mic_asr_doubao_send_pcm(const int16_t *pcm, size_t bytes)
             if (s_asr.connection_broken || s_asr.response_error) {
                 return ESP_FAIL;
             }
-            if (s_asr.local_audio_finished) {
+            if (s_asr.final_received) {
+                return ESP_OK;
+            }
+            if (s_asr.response_done) {
+                return s_asr.final_text[0] != '\0' ? ESP_OK : ESP_ERR_NOT_FOUND;
+            }
+            if (s_asr.last_audio_sent) {
                 return ESP_OK;
             }
         }
@@ -1979,12 +2092,21 @@ esp_err_t mic_asr_doubao_finish(char *text_buf, size_t text_buf_size)
         ESP_LOGW(TAG, "ASR connection already broken, skip last audio packet");
         return ESP_FAIL;
     }
-    if (!s_asr.session_ready || s_asr.ws.tls == NULL || !s_asr.ws.connected) {
+    if (!s_asr.session_ready || s_asr.ws.tls == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_asr.final_received) {
+        return mic_asr_doubao_copy_final_text(text_buf, text_buf_size);
+    }
+    if (!s_asr.response_done && !s_asr.ws.connected) {
         return ESP_ERR_INVALID_STATE;
     }
 
     esp_err_t ret = ESP_OK;
-    if (!s_asr.local_audio_finished) {
+    if (!s_asr.final_received && !s_asr.last_audio_sent) {
+        if (!s_asr.ws.connected) {
+            return ESP_ERR_INVALID_STATE;
+        }
         ret = mic_asr_doubao_flush_pending_audio(true);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "send last audio packet failed: %s", esp_err_to_name(ret));
@@ -2006,6 +2128,9 @@ esp_err_t mic_asr_doubao_finish(char *text_buf, size_t text_buf_size)
         }
 
         ret = mic_asr_doubao_poll_server_once(remaining_ms);
+        if (ret == ESP_ERR_NOT_FOUND) {
+            break;
+        }
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "ASR poll server while finishing failed: %s", esp_err_to_name(ret));
             return ret;
@@ -2019,25 +2144,25 @@ esp_err_t mic_asr_doubao_finish(char *text_buf, size_t text_buf_size)
     if (s_asr.response_error) {
         return ESP_FAIL;
     }
-    if (s_asr.recognized_text[0] == '\0') {
+    if (s_asr.final_text[0] == '\0') {
         ESP_LOGI(TAG, "本次未识别到文字");
-        return ESP_OK;
+        return ESP_ERR_NOT_FOUND;
     }
 
-    if (text_buf != NULL && text_buf_size > 0) {
-        strlcpy(text_buf, s_asr.recognized_text, text_buf_size);
-    }
-#if MIC_ASR_DOUBAO_ENABLE_RESULT_PRINT
-    ESP_LOGI(TAG, "ASR result: %s", s_asr.recognized_text);
-    printf("ASR result: %s\n", s_asr.recognized_text);
-    fflush(stdout);
-#endif
-    return ESP_OK;
+    return mic_asr_doubao_copy_final_text(text_buf, text_buf_size);
+}
+
+bool mic_asr_doubao_session_has_final(void)
+{
+    return s_asr.session_ready &&
+           s_asr.final_received &&
+           !s_asr.response_error &&
+           s_asr.final_text[0] != '\0';
 }
 
 void mic_asr_doubao_stop(void)
 {
-    if (s_asr.connection_broken && s_asr.ws.tls != NULL) {
+    if ((s_asr.connection_broken || s_asr.server_closed) && s_asr.ws.tls != NULL) {
         s_asr.ws.connected = false;
     }
     manual_ws_close(&s_asr.ws);

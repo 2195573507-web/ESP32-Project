@@ -20,6 +20,11 @@
 
 static const char *TAG = "manual_ws";
 
+enum {
+    MANUAL_WS_TLS_READ_WANT_READ = -0x6900,
+    MANUAL_WS_TLS_READ_TIMEOUT_WARN_EVERY = 20,
+};
+
 /**
  * @brief manual_ws 详细调试日志入口。
  *
@@ -176,23 +181,37 @@ static esp_err_t manual_ws_tls_read_exact(esp_tls_t *tls, uint8_t *out, size_t o
         return ESP_ERR_INVALID_ARG;
     }
 
+    static uint32_t consecutive_no_data_count;
     size_t read_total = 0;
     while (read_total < out_len) {
         ssize_t read_len = esp_tls_conn_read(tls, out + read_total, out_len - read_total);
         if (read_len > 0) {
+            consecutive_no_data_count = 0;
             read_total += (size_t)read_len;
             continue;
         }
         if (read_len == 0) {
+            consecutive_no_data_count = 0;
             ESP_LOGW(TAG, "manual_ws 服务器主动关闭 TLS 连接");
             return ESP_ERR_INVALID_STATE;
         }
 
         if (read_total == 0) {
-            ESP_LOGW(TAG, "manual_ws TLS 读取超时或暂时无数据: read=%d", (int)read_len);
+            consecutive_no_data_count++;
+            if ((int)read_len == MANUAL_WS_TLS_READ_WANT_READ) {
+                ESP_LOGD(TAG, "manual_ws TLS 暂时无数据: read=%d", (int)read_len);
+            } else if ((consecutive_no_data_count % MANUAL_WS_TLS_READ_TIMEOUT_WARN_EVERY) == 0) {
+                ESP_LOGW(TAG,
+                         "manual_ws TLS 连续读取超时或暂时无数据: count=%" PRIu32 ", read=%d",
+                         consecutive_no_data_count,
+                         (int)read_len);
+            } else {
+                ESP_LOGD(TAG, "manual_ws TLS 读取超时或暂时无数据: read=%d", (int)read_len);
+            }
             return ESP_ERR_TIMEOUT;
         }
 
+        consecutive_no_data_count = 0;
         ESP_LOGE(TAG,
                  "manual_ws TLS 读取中断: read=%d, total=%u/%u",
                  (int)read_len,

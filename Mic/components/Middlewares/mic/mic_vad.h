@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "app_debug_config.h"
+
 /**
  * @file mic_vad.h
  * @brief 独立的最小语音活动检测模块。
@@ -12,12 +14,12 @@
 
 /* VAD 参数：当前 MIC_ADC 每帧 3200 samples / 16000 Hz = 200 ms。 */
 #define MIC_VAD_FRAME_MS           200 // 每帧统计对应的时间。
-#define MIC_VAD_START_RMS          800 // 连续超过该 PCM RMS 才认为开始说话。
-#define MIC_VAD_END_RMS            350 // 连续低于该 PCM RMS 才认为说话结束。
+#define MIC_VAD_START_RMS          APP_ASR_VAD_SPEECH_START_RMS // 连续超过该 PCM RMS 才认为开始说话。
+#define MIC_VAD_END_RMS            APP_ASR_VAD_SPEECH_END_RMS   // 连续低于该 PCM RMS 才认为说话结束。
 #define MIC_VAD_START_FRAMES       2   // 连续 2 帧超过阈值才开始，约 400 ms。
-#define MIC_VAD_END_FRAMES         8   // 连续 8 帧低于阈值才结束，约 1.6 s。
+#define MIC_VAD_END_FRAMES         ((APP_ASR_VAD_SILENCE_END_MS + MIC_VAD_FRAME_MS - 1) / MIC_VAD_FRAME_MS) // 连续静音达到配置时长才结束。
 #define MIC_VAD_MIN_SPEECH_FRAMES  2   // 小于 400 ms 的语音忽略。
-#define MIC_VAD_MAX_SPEECH_FRAMES  40  // 最长 8 s，防止卡死。
+#define MIC_VAD_MAX_SPEECH_FRAMES  ((APP_ASR_VAD_MAX_RECORD_MS + MIC_VAD_FRAME_MS - 1) / MIC_VAD_FRAME_MS) // 最长录音时长，防止卡死。
 
 /**
  * @brief VAD 状态机状态

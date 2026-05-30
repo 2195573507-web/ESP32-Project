@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "app_debug_config.h"
 
 /**
  * @file mic_asr_doubao_parser.h
@@ -59,11 +60,15 @@
 #define MIC_ASR_DOUBAO_PARSER_COMPRESS_GZIP      0x1  // gzip 压缩。
 
 /* 串口打印保护：payload 太长时只复制和打印前面一段，避免占用过多堆内存。 */
-#define MIC_ASR_DOUBAO_PARSER_MAX_PRINT_BYTES       2048 // 单次安全文本打印的最大 payload 字节数。
-#define MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG      0    // 服务端帧/payload 详细调试日志；默认关闭，SERVER_ERROR 仍会常显。
-#define MIC_ASR_DOUBAO_PARSER_HEX_PREVIEW_BYTES     256  // 服务端业务 payload 仅打印前 256 字节 hex。
-#define MIC_ASR_DOUBAO_PARSER_JSON_FIELD_MAX_CHARS  128  // JSON code/message/result/text 字段最多打印 128 字符。
-#define MIC_ASR_DOUBAO_PARSER_GZIP_MAX_OUTPUT_BYTES 4096 // gzip 调试解压最多输出 4KB，防止异常响应占用过多内存。
+#define MIC_ASR_DOUBAO_PARSER_MAX_PRINT_BYTES       APP_DEBUG_ASR_PARSER_MAX_PRINT_BYTES       // 单次安全文本打印的最大 payload 字节数。
+#define MIC_ASR_DOUBAO_PARSER_ENABLE_HEADER_LOG     APP_DEBUG_ASR_PROTOCOL_HEADER_LOG          // 服务端业务协议头字段日志。
+#define MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_TEXT_LOG (APP_DEBUG_ASR_PAYLOAD_TEXT_DUMP || APP_DEBUG_ASR_PAYLOAD_FULL_TEXT_DUMP) // payload 文本/JSON/protobuf 摘要。
+#define MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_HEX_LOG APP_DEBUG_ASR_PAYLOAD_HEX_DUMP            // payload 十六进制预览。
+#define MIC_ASR_DOUBAO_PARSER_ENABLE_SERVER_ERROR_DETAIL_LOG APP_DEBUG_ASR_SERVER_ERROR_DETAIL_LOG // SERVER_ERROR 协议字段和帧前缀。
+#define MIC_ASR_DOUBAO_PARSER_ENABLE_DEBUG_LOG      (MIC_ASR_DOUBAO_PARSER_ENABLE_HEADER_LOG || MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_TEXT_LOG || MIC_ASR_DOUBAO_PARSER_ENABLE_PAYLOAD_HEX_LOG || MIC_ASR_DOUBAO_PARSER_ENABLE_SERVER_ERROR_DETAIL_LOG) // 兼容旧调试总开关。
+#define MIC_ASR_DOUBAO_PARSER_HEX_PREVIEW_BYTES     APP_DEBUG_ASR_PAYLOAD_HEX_PREVIEW_BYTES    // 服务端业务 payload hex 预览字节数。
+#define MIC_ASR_DOUBAO_PARSER_JSON_FIELD_MAX_CHARS  APP_DEBUG_ASR_PARSER_JSON_FIELD_MAX_CHARS  // JSON code/message/result/text 字段最多打印字符数。
+#define MIC_ASR_DOUBAO_PARSER_GZIP_MAX_OUTPUT_BYTES APP_DEBUG_ASR_PARSER_GZIP_MAX_OUTPUT_BYTES // gzip 调试解压最多输出字节数。
 
 /**
  * @brief 解析豆包 ASR 服务端 WebSocket binary payload。
