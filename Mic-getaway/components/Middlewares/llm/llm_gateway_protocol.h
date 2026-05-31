@@ -28,6 +28,17 @@ typedef struct {
     size_t audio_len;                             // 音频字节数，当前 TTS 禁用时只记录长度。
 } llm_gateway_asr_event_t;
 
+typedef struct {
+    bool is_session_updated;                      // true 表示 TTS session 配置已生效。
+    bool is_audio_delta;                          // true 表示本事件携带一段 TTS 音频。
+    bool is_audio_done;                           // true 表示本轮 TTS 音频输出完成。
+    bool is_error;                                // true 表示服务端错误事件。
+    char type[96];                                // 服务端事件 type/event 名。
+    char message[160];                            // 服务端错误/状态说明。
+    int code;                                     // 服务端状态码或本地错误码。
+    size_t audio_len;                             // 解码后的音频字节数。
+} llm_gateway_tts_event_t;
+
 /**
  * @brief 生成 Authorization Header 值。
  *
@@ -161,6 +172,58 @@ esp_err_t llm_gateway_protocol_build_asr_ws_finish_event(char **out_json,
 esp_err_t llm_gateway_protocol_parse_asr_ws_event(const char *payload,
                                                   size_t payload_len,
                                                   llm_gateway_asr_event_t *out_event);
+
+/**
+ * @brief 组装 TTS Realtime tts_session.update JSON。
+ *
+ * 调用方法：TTS WebSocket 建连成功后立即发送，更新音色和输出音频参数。
+ *
+ * @param model TTS 模型名，不能为空。
+ * @param out_json 输出 JSON 字符串指针，不能为空。
+ * @param out_len 输出 JSON 字节数，不能为空。
+ * @return 成功返回 ESP_OK；参数错误或内存不足时返回错误码。
+ */
+esp_err_t llm_gateway_protocol_build_tts_ws_session_update(const char *model,
+                                                           char **out_json,
+                                                           size_t *out_len);
+
+/**
+ * @brief 组装 TTS Realtime input_text.append JSON。
+ *
+ * @param text 待合成文本，不能为空。
+ * @param out_json 输出 JSON 字符串指针，不能为空。
+ * @param out_len 输出 JSON 字节数，不能为空。
+ * @return 成功返回 ESP_OK；参数错误或内存不足时返回错误码。
+ */
+esp_err_t llm_gateway_protocol_build_tts_ws_text_append(const char *text,
+                                                        char **out_json,
+                                                        size_t *out_len);
+
+/**
+ * @brief 组装 TTS Realtime input_text.done JSON。
+ *
+ * @param out_json 输出 JSON 字符串指针，不能为空。
+ * @param out_len 输出 JSON 字节数，不能为空。
+ * @return 成功返回 ESP_OK；参数错误或内存不足时返回错误码。
+ */
+esp_err_t llm_gateway_protocol_build_tts_ws_text_done(char **out_json,
+                                                      size_t *out_len);
+
+/**
+ * @brief 解析 TTS WebSocket 服务端事件，并解码 response.audio.delta。
+ *
+ * @param payload WebSocket payload，不能为空。
+ * @param payload_len payload 字节数，必须大于 0。
+ * @param audio_buf TTS 音频输出缓冲区，不能为空。
+ * @param audio_buf_size audio_buf 字节数。
+ * @param out_event 输出解析结果，不能为空。
+ * @return 成功返回 ESP_OK；payload 不是可识别 JSON 或音频缓冲不足时返回错误码。
+ */
+esp_err_t llm_gateway_protocol_parse_tts_ws_event(const char *payload,
+                                                  size_t payload_len,
+                                                  uint8_t *audio_buf,
+                                                  size_t audio_buf_size,
+                                                  llm_gateway_tts_event_t *out_event);
 
 /**
  * @brief 释放本协议模块分配的 JSON 字符串。

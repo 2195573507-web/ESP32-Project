@@ -5,6 +5,7 @@ set(srcs
             llm/volc_gateway_auth.c
             llm/llm_gateway_http.c
             llm/llm_gateway_ws.c
+            llm/llm_gateway_tts_ws.c
             llm/llm_gateway_protocol.c
             mic/mic_adc_test.c
             mic/mic_adc_pcm.c

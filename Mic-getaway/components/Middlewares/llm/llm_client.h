@@ -22,6 +22,7 @@ typedef enum {
     LLM_CLIENT_STATE_ASR_STREAMING,   // ASR 已连接，允许发送 PCM。
     LLM_CLIENT_STATE_ASR_FINISHING,   // 已发送 commit，等待 final 或关闭。
     LLM_CLIENT_STATE_CHAT_REQUESTING, // 显式 Chat 请求中；ASR final 自动 Chat 在后台任务中发送。
+    LLM_CLIENT_STATE_TTS_REQUESTING,  // 显式 TTS 请求中；不由 Mic 主链路自动进入。
 } llm_client_state_t;
 
 typedef enum {
@@ -32,20 +33,20 @@ typedef enum {
     LLM_CLIENT_EVENT_LLM_DELTA_TEXT,   // LLM 增量文本占位，当前未启用流式 LLM。
     LLM_CLIENT_EVENT_LLM_FINAL_TEXT,   // LLM final 文本。
     LLM_CLIENT_EVENT_COMMAND_RESULT,   // router 已处理 command/speech 结果。
-    LLM_CLIENT_EVENT_TTS_AUDIO,        // TTS 音频占位，当前忽略。
+    LLM_CLIENT_EVENT_TTS_AUDIO,        // TTS 音频 chunk，可交给 speaker 底层播放。
     LLM_CLIENT_EVENT_ERROR,            // 网关、解析或 router 错误。
 } llm_client_event_type_t;
 
 typedef enum {
     LLM_CLIENT_CAP_ASR = 0, // Mic 语音识别能力，对应 LLM_GATEWAY_ASR_MODEL。
     LLM_CLIENT_CAP_TEXT,    // 文本理解/命令决策能力，对应 LLM_GATEWAY_TEXT_MODEL。
-    LLM_CLIENT_CAP_TTS,     // 语音合成能力，对应 LLM_GATEWAY_TTS_MODEL，当前禁用。
+    LLM_CLIENT_CAP_TTS,     // 语音合成能力，对应 LLM_GATEWAY_TTS_MODEL。
 } llm_client_capability_t;
 
 typedef struct {
     llm_client_event_type_t type; // 事件类型。
     const char *text;             // 文本事件内容，可为空。
-    const uint8_t *audio;         // 音频事件数据，当前 TTS 禁用时为空。
+    const uint8_t *audio;         // 音频事件数据，仅 TTS_AUDIO 事件有效。
     size_t audio_len;             // audio 字节数。
     int code;                     // 错误码或服务端状态码。
     const char *message;          // 错误/状态说明，可为空。
@@ -215,19 +216,21 @@ esp_err_t llm_client_send_csi_json(const char *json);
 esp_err_t llm_client_send_system_status_json(const char *json);
 
 /**
- * @brief TTS 文本接口占位。
+ * @brief 显式 TTS 文本合成接口。
  *
- * 调用方法：当前阶段 TTS 禁用，本函数返回 ESP_ERR_NOT_SUPPORTED，不播放音频。
+ * 调用方法：speaker bridge 需要播报时调用。函数会通过 Realtime TTS 获取
+ * PCM 音频 chunk，并通过 LLM_CLIENT_EVENT_TTS_AUDIO 回调上报；当前不自动接入
+ * Mic/Chat 主链路，也不直接播放。
  *
  * @param text 待播报文本，不能为空。
- * @return 当前固定返回 ESP_ERR_NOT_SUPPORTED。
+ * @return 成功完成合成返回 ESP_OK；未启用、非空闲、网关错误或超时返回错误码。
  */
 esp_err_t llm_client_tts_text(const char *text);
 
 /**
  * @brief 查询 TTS 是否启用。
  *
- * @return 当前 LLM_GATEWAY_ENABLE_TTS 为 0，返回 false。
+ * @return LLM_GATEWAY_ENABLE_TTS 非 0 时返回 true。
  */
 bool llm_client_is_tts_enabled(void);
 

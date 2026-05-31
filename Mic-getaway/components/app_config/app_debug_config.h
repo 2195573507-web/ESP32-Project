@@ -45,7 +45,7 @@
 
 /* LLM bridge 调试：默认保留桥接入口事件，具体 payload 仍由上面的网关开关控制。 */
 #define APP_DEBUG_MIC_LLM_BRIDGE                   1  // Mic bridge 语音起止和 llm_client 事件。
-#define APP_DEBUG_SPEAKER_LLM_BRIDGE               1  // speaker bridge/TTS 占位调用。
+#define APP_DEBUG_SPEAKER_LLM_BRIDGE               1  // speaker bridge/TTS 合成调用日志。
 #define APP_DEBUG_BME690_LLM_BRIDGE                1  // BME690 bridge 传感器上下文调用。
 #define APP_DEBUG_CSI_LLM_BRIDGE                   1  // CSI bridge 传感器上下文调用。
 #define APP_DEBUG_SYSTEM_LLM_BRIDGE                1  // system bridge 状态 JSON。

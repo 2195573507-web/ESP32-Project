@@ -58,6 +58,11 @@ static void mic_llm_bridge_event_cb(const llm_client_event_t *event, void *user_
         (void)ai_mic_bridge_on_asr_final(event->text);
         return;
     }
+    if (event->type == LLM_CLIENT_EVENT_TTS_AUDIO) {
+        ESP_LOGI(TAG, "LLM event tts_audio: bytes=%u",
+                 (unsigned int)event->audio_len);
+        return;
+    }
 
     if (event->text != NULL && event->text[0] != '\0') {
         ESP_LOGI(TAG, "LLM event %s: %s", mic_llm_bridge_event_name(event->type), event->text);

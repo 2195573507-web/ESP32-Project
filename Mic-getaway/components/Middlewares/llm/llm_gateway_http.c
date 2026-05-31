@@ -47,7 +47,7 @@ static void llm_gateway_http_log_reject_hint(int status_code,
              key_summary);
     ESP_LOGE(TAG,
              "Check Authorization Bearer API key, check whether API key is bound to Chat model %s, "
-             "check Chat model name and /v1/chat/completions permission.",
+             "check Chat model name and Chat Completions permission.",
              model != NULL ? model : "<null>");
 
     if (response != NULL && response[0] != '\0') {

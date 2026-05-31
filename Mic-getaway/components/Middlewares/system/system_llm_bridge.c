@@ -118,14 +118,15 @@ esp_err_t system_llm_bridge_get_status_json(char *out, size_t out_size)
                            out_size,
                            "{\"free_heap\":%u,\"min_free_heap\":%u,\"free_psram\":%u,"
                            "\"largest_free_block\":%u,\"wifi_connected\":%s,"
-                           "\"asr_active\":%s,\"llm_state\":\"%s\",\"tts_enabled\":false}",
+                           "\"asr_active\":%s,\"llm_state\":\"%s\",\"tts_enabled\":%s}",
                            (unsigned int)snapshot.free_heap,
                            (unsigned int)snapshot.min_free_heap,
                            (unsigned int)snapshot.free_psram,
                            (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
                            snapshot.wifi_connected ? "true" : "false",
                            snapshot.asr_active ? "true" : "false",
-                           llm_client_state_name((llm_client_state_t)snapshot.llm_state));
+                           llm_client_state_name((llm_client_state_t)snapshot.llm_state),
+                           llm_client_is_tts_enabled() ? "true" : "false");
     if (written < 0 || (size_t)written >= out_size) {
         return ESP_ERR_INVALID_SIZE;
     }

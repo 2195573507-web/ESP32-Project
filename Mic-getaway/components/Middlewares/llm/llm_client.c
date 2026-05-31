@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 #include "llm_gateway_http.h"
 #include "llm_gateway_protocol.h"
+#include "llm_gateway_tts_ws.h"
 #include "llm_gateway_ws.h"
 
 static const char *TAG = "llm_client";
@@ -73,6 +74,8 @@ const char *llm_client_state_name(llm_client_state_t state)
         return "ASR_FINISHING";
     case LLM_CLIENT_STATE_CHAT_REQUESTING:
         return "CHAT_REQUESTING";
+    case LLM_CLIENT_STATE_TTS_REQUESTING:
+        return "TTS_REQUESTING";
     default:
         return "UNKNOWN";
     }
@@ -453,6 +456,49 @@ static void llm_client_ws_event_cb(const llm_gateway_ws_event_t *event, void *us
     }
 }
 
+static void llm_client_tts_ws_event_cb(const llm_gateway_tts_ws_event_t *event, void *user_ctx)
+{
+    (void)user_ctx;
+    if (event == NULL) {
+        return;
+    }
+
+    switch (event->type) {
+    case LLM_GATEWAY_TTS_WS_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "TTS connected");
+        break;
+    case LLM_GATEWAY_TTS_WS_EVENT_SESSION_UPDATED:
+        ESP_LOGI(TAG, "TTS session updated");
+        break;
+    case LLM_GATEWAY_TTS_WS_EVENT_AUDIO_DELTA:
+        if (event->audio != NULL && event->audio_len > 0) {
+            ESP_LOGI(TAG, "TTS AUDIO chunk bytes=%u", (unsigned int)event->audio_len);
+            llm_client_emit(LLM_CLIENT_EVENT_TTS_AUDIO,
+                            NULL,
+                            event->audio,
+                            event->audio_len,
+                            0,
+                            NULL);
+        }
+        break;
+    case LLM_GATEWAY_TTS_WS_EVENT_AUDIO_DONE:
+        ESP_LOGI(TAG, "TTS audio done");
+        break;
+    case LLM_GATEWAY_TTS_WS_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "TTS disconnected");
+        break;
+    case LLM_GATEWAY_TTS_WS_EVENT_ERROR:
+    default:
+        llm_client_emit(LLM_CLIENT_EVENT_ERROR,
+                        NULL,
+                        NULL,
+                        0,
+                        event->code,
+                        event->message != NULL ? event->message : "TTS WebSocket error");
+        break;
+    }
+}
+
 esp_err_t llm_client_init(const llm_client_config_t *config)
 {
     if (s_client.initialized) {
@@ -682,7 +728,10 @@ esp_err_t llm_client_cancel_asr_session(void)
 
 bool llm_client_is_voice_session_active(void)
 {
-    return s_client.initialized && s_client.state != LLM_CLIENT_STATE_IDLE;
+    return s_client.initialized &&
+           (s_client.state == LLM_CLIENT_STATE_ASR_CONNECTING ||
+            s_client.state == LLM_CLIENT_STATE_ASR_STREAMING ||
+            s_client.state == LLM_CLIENT_STATE_ASR_FINISHING);
 }
 
 llm_client_state_t llm_client_get_state(void)
@@ -754,6 +803,9 @@ esp_err_t llm_client_send_system_status_json(const char *json)
 
 esp_err_t llm_client_tts_text(const char *text)
 {
+    if (!s_client.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (text == NULL || text[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
@@ -761,8 +813,36 @@ esp_err_t llm_client_tts_text(const char *text)
     if (model == NULL || model[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
-    ESP_LOGI(TAG, "TTS disabled, skip text_len=%u", (unsigned int)strlen(text));
-    return ESP_ERR_NOT_SUPPORTED;
+    if (!LLM_GATEWAY_ENABLE_TTS) {
+        ESP_LOGW(TAG, "gateway TTS reserved but not enabled");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (s_client.state != LLM_CLIENT_STATE_IDLE) {
+        ESP_LOGW(TAG, "TTS request rejected: state=%s", llm_client_state_name(s_client.state));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    llm_client_set_state(LLM_CLIENT_STATE_TTS_REQUESTING);
+    ESP_LOGI(TAG, "TTS request start: model=%s text_len=%u", model, (unsigned int)strlen(text));
+    llm_gateway_tts_ws_config_t tts_config = {
+        .tts_model = model,
+        .event_cb = llm_client_tts_ws_event_cb,
+        .user_ctx = NULL,
+    };
+    esp_err_t ret = llm_gateway_tts_ws_synthesize(&tts_config, text);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "TTS request failed: %s", esp_err_to_name(ret));
+        llm_client_emit(LLM_CLIENT_EVENT_ERROR,
+                        NULL,
+                        NULL,
+                        0,
+                        ret,
+                        "TTS request failed");
+    } else {
+        ESP_LOGI(TAG, "TTS request done");
+    }
+    llm_client_set_state(LLM_CLIENT_STATE_IDLE);
+    return ret;
 }
 
 bool llm_client_is_tts_enabled(void)

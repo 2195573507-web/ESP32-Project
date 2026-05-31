@@ -53,6 +53,36 @@ esp_err_t volc_gateway_auth_build_ws_headers(char *out, size_t out_size)
     return ESP_OK;
 }
 
+esp_err_t volc_gateway_auth_build_tts_ws_headers(char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char auth_value[256] = {0};
+    esp_err_t ret = volc_gateway_auth_build_authorization(auth_value, sizeof(auth_value));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    int written = snprintf(out,
+                           out_size,
+                           "Authorization: %s\r\n"
+#if VOLC_GATEWAY_TTS_USE_RESOURCE_ID
+                           "X-Api-Resource-Id: %s\r\n"
+#endif
+                           ,
+                           auth_value
+#if VOLC_GATEWAY_TTS_USE_RESOURCE_ID
+                           , VOLC_GATEWAY_TTS_RESOURCE_ID
+#endif
+                           );
+    if (written < 0 || (size_t)written >= out_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+
 void volc_gateway_auth_make_key_summary(char *out, size_t out_size)
 {
     if (out == NULL || out_size == 0) {
