@@ -36,13 +36,12 @@
 #define APP_DEBUG_ASR_PCM_EVERY_PACKET_STATS       0  // 1 表示每包统计；0 表示按间隔统计。
 #define APP_DEBUG_ASR_PCM_HEX_DUMP                 0  // 每个音频包前 N 字节 PCM hex，默认关闭。
 
-/* 豆包边缘大模型网关调试：默认只打印关键状态，不打印 PCM 原始数据或明文 API Key。 */
+/* 火山引擎边缘大模型网关调试：默认只打印关键状态，不打印 PCM 原始数据或明文 API Key。 */
 #define APP_DEBUG_LLM_CLIENT                       1  // llm_client 生命周期、状态机和会话结果。
-#define APP_DEBUG_LLM_GATEWAY_HTTP                 1  // HTTP ASR fallback / LLM chat 请求状态。
+#define APP_DEBUG_LLM_GATEWAY_HTTP                 1  // HTTP Chat 预留请求状态。
 #define APP_DEBUG_LLM_GATEWAY_WS                   1  // 官方 WebSocket ASR 建连、收发状态。
 #define APP_DEBUG_LLM_GATEWAY_PROTO                1  // 网关 JSON 协议组装/解析摘要。
 #define APP_DEBUG_LLM_GATEWAY_AUDIO                0  // 音频 chunk 尺寸日志；不打印 PCM 原始数据。
-#define APP_DEBUG_LLM_ROUTER                       1  // command/speech router 解析和执行结果。
 
 /* LLM bridge 调试：默认保留桥接入口事件，具体 payload 仍由上面的网关开关控制。 */
 #define APP_DEBUG_MIC_LLM_BRIDGE                   1  // Mic bridge 语音起止和 llm_client 事件。

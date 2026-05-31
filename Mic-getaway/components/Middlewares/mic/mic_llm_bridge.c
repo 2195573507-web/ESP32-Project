@@ -43,15 +43,19 @@ static void mic_llm_bridge_event_cb(const llm_client_event_t *event, void *user_
         return;
     }
 
-    if (event->type == LLM_CLIENT_EVENT_TTS_AUDIO) {
-        ESP_LOGI(TAG, "LLM event %s: audio_len=%u ignored", mic_llm_bridge_event_name(event->type), (unsigned int)event->audio_len);
-        return;
-    }
     if (event->type == LLM_CLIENT_EVENT_ERROR) {
         ESP_LOGE(TAG,
                  "LLM event error: code=%d message=%s",
                  event->code,
                  event->message != NULL ? event->message : "<none>");
+        return;
+    }
+    if (event->type == LLM_CLIENT_EVENT_ASR_PARTIAL_TEXT) {
+        (void)ai_mic_bridge_on_asr_partial(event->text);
+        return;
+    }
+    if (event->type == LLM_CLIENT_EVENT_ASR_FINAL_TEXT) {
+        (void)ai_mic_bridge_on_asr_final(event->text);
         return;
     }
 
@@ -62,16 +66,13 @@ static void mic_llm_bridge_event_cb(const llm_client_event_t *event, void *user_
     }
 }
 
-esp_err_t mic_llm_bridge_init(void)
+esp_err_t ai_mic_bridge_init(void)
 {
     if (s_mic_llm_bridge_initialized) {
         return ESP_OK;
     }
 
     llm_client_config_t config = {
-        .asr_model = MIC_LLM_BRIDGE_ASR_MODEL,
-        .llm_model = MIC_LLM_BRIDGE_LLM_MODEL,
-        .tts_model = MIC_LLM_BRIDGE_TTS_MODEL,
         .system_prompt = LLM_GATEWAY_SYSTEM_PROMPT,
         .event_cb = mic_llm_bridge_event_cb,
         .user_ctx = NULL,
@@ -87,16 +88,25 @@ esp_err_t mic_llm_bridge_init(void)
     return ESP_OK;
 }
 
-esp_err_t mic_llm_bridge_on_voice_start(void)
+esp_err_t ai_mic_bridge_voice_start(void)
 {
     if (!s_mic_llm_bridge_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
+    llm_client_state_t state = llm_client_get_state();
+    if (state == LLM_CLIENT_STATE_ASR_FINISHING) {
+        ESP_LOGI(TAG, "ASR busy finishing previous session");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (state != LLM_CLIENT_STATE_IDLE) {
+        ESP_LOGW(TAG, "voice_start rejected: llm_client state=%s", llm_client_state_name(state));
+        return ESP_ERR_INVALID_STATE;
+    }
     ESP_LOGI(TAG, "voice_start");
-    return llm_client_start_voice_session();
+    return llm_client_start_asr_session();
 }
 
-esp_err_t mic_llm_bridge_on_pcm_chunk(const int16_t *pcm, size_t samples, uint32_t sample_rate_hz)
+esp_err_t ai_mic_bridge_pcm_append(const int16_t *pcm, size_t samples)
 {
     if (!s_mic_llm_bridge_initialized) {
         return ESP_ERR_INVALID_STATE;
@@ -105,7 +115,7 @@ esp_err_t mic_llm_bridge_on_pcm_chunk(const int16_t *pcm, size_t samples, uint32
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = llm_client_send_audio_pcm16(pcm, samples, sample_rate_hz);
+    esp_err_t ret = llm_client_send_asr_pcm(pcm, samples);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "pcm_chunk failed, stop session: %s", esp_err_to_name(ret));
         (void)llm_client_stop_voice_session();
@@ -115,7 +125,7 @@ esp_err_t mic_llm_bridge_on_pcm_chunk(const int16_t *pcm, size_t samples, uint32
     return ret;
 }
 
-esp_err_t mic_llm_bridge_on_voice_end(void)
+esp_err_t ai_mic_bridge_voice_end(void)
 {
     if (!s_mic_llm_bridge_initialized) {
         return ESP_ERR_INVALID_STATE;
@@ -125,7 +135,7 @@ esp_err_t mic_llm_bridge_on_voice_end(void)
         return ESP_OK;
     }
 
-    esp_err_t ret = llm_client_finish_voice_session();
+    esp_err_t ret = llm_client_finish_asr_session();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "voice_end finish failed: %s", esp_err_to_name(ret));
         (void)llm_client_stop_voice_session();
@@ -133,11 +143,75 @@ esp_err_t mic_llm_bridge_on_voice_end(void)
     return ret;
 }
 
-esp_err_t mic_llm_bridge_stop(void)
+esp_err_t ai_mic_bridge_voice_cancel(void)
 {
     if (!s_mic_llm_bridge_initialized) {
         return ESP_OK;
     }
     ESP_LOGI(TAG, "session stop");
-    return llm_client_stop_voice_session();
+    return llm_client_cancel_asr_session();
+}
+
+bool ai_mic_bridge_is_idle(void)
+{
+    return s_mic_llm_bridge_initialized &&
+           llm_client_get_state() == LLM_CLIENT_STATE_IDLE;
+}
+
+bool ai_mic_bridge_is_asr_finishing(void)
+{
+    return s_mic_llm_bridge_initialized &&
+           llm_client_get_state() == LLM_CLIENT_STATE_ASR_FINISHING;
+}
+
+const char *ai_mic_bridge_state_name(void)
+{
+    if (!s_mic_llm_bridge_initialized) {
+        return "UNINITIALIZED";
+    }
+    return llm_client_state_name(llm_client_get_state());
+}
+
+esp_err_t ai_mic_bridge_on_asr_partial(const char *text)
+{
+    if (text != NULL && text[0] != '\0') {
+        ESP_LOGI(TAG, "ASR PARTIAL: %s", text);
+    }
+    return ESP_OK;
+}
+
+esp_err_t ai_mic_bridge_on_asr_final(const char *text)
+{
+    if (text != NULL && text[0] != '\0') {
+        ESP_LOGI(TAG, "ASR FINAL: %s", text);
+    }
+    return ESP_OK;
+}
+
+esp_err_t mic_llm_bridge_init(void)
+{
+    return ai_mic_bridge_init();
+}
+
+esp_err_t mic_llm_bridge_on_voice_start(void)
+{
+    return ai_mic_bridge_voice_start();
+}
+
+esp_err_t mic_llm_bridge_on_pcm_chunk(const int16_t *pcm, size_t samples, uint32_t sample_rate_hz)
+{
+    if (sample_rate_hz != LLM_GATEWAY_AUDIO_SAMPLE_RATE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ai_mic_bridge_pcm_append(pcm, samples);
+}
+
+esp_err_t mic_llm_bridge_on_voice_end(void)
+{
+    return ai_mic_bridge_voice_end();
+}
+
+esp_err_t mic_llm_bridge_stop(void)
+{
+    return ai_mic_bridge_voice_cancel();
 }

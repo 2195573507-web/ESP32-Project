@@ -1,51 +1,66 @@
 #include "llm_client.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "llm_gateway_http.h"
 #include "llm_gateway_protocol.h"
 #include "llm_gateway_ws.h"
-#include "llm_router.h"
 
 static const char *TAG = "llm_client";
 
-typedef enum {
-    LLM_CLIENT_STATE_IDLE = 0,
-    LLM_CLIENT_STATE_ASR_CONNECTING,
-    LLM_CLIENT_STATE_ASR_STREAMING,
-    LLM_CLIENT_STATE_ASR_WAIT_FINAL,
-    LLM_CLIENT_STATE_LLM_REQUESTING,
-    LLM_CLIENT_STATE_ROUTING,
-    LLM_CLIENT_STATE_ERROR,
-} llm_client_state_t;
+enum {
+    LLM_CLIENT_ASR_FINAL_BIT = BIT0,
+    LLM_CLIENT_ASR_DISCONNECTED_BIT = BIT1,
+    LLM_CLIENT_ASR_ERROR_BIT = BIT2,
+    LLM_CLIENT_ASR_FINISH_BITS = LLM_CLIENT_ASR_FINAL_BIT |
+                                 LLM_CLIENT_ASR_DISCONNECTED_BIT |
+                                 LLM_CLIENT_ASR_ERROR_BIT,
+};
 
 typedef struct {
     bool initialized;
     llm_client_state_t state;
     llm_client_event_cb_t event_cb;
     void *user_ctx;
-    const char *asr_model;
-    const char *llm_model;
-    const char *tts_model;
     const char *system_prompt;
     char asr_final_text[LLM_GATEWAY_ASR_TEXT_MAX_BYTES];
+    char asr_last_partial_text[LLM_GATEWAY_ASR_TEXT_MAX_BYTES];
+    char pending_chat_text[LLM_GATEWAY_ASR_TEXT_MAX_BYTES];
     char llm_final_text[LLM_GATEWAY_LLM_RESPONSE_MAX_BYTES];
-    int16_t *record_buffer;
-    size_t record_sample_count;
-    size_t record_capacity_samples;
-    bool record_overflowed;
+    TaskHandle_t asr_final_task_handle;
+    EventGroupHandle_t asr_event_group;
+    TickType_t asr_last_event_tick;
+    uint32_t asr_event_count;
+    uint32_t pcm_packet_count;
     bool ws_started;
+    bool asr_final_received;
+    bool asr_partial_received;
 } llm_client_context_t;
 
 static llm_client_context_t s_client;
 
-static const char *llm_client_state_name(llm_client_state_t state)
+static void llm_client_asr_final_task(void *arg);
+
+static const char *llm_client_get_model_name(llm_client_capability_t cap)
+{
+    switch (cap) {
+    case LLM_CLIENT_CAP_ASR:
+        return LLM_GATEWAY_ASR_MODEL;
+    case LLM_CLIENT_CAP_TEXT:
+        return LLM_GATEWAY_TEXT_MODEL;
+    case LLM_CLIENT_CAP_TTS:
+        return LLM_GATEWAY_TTS_MODEL;
+    default:
+        return NULL;
+    }
+}
+
+const char *llm_client_state_name(llm_client_state_t state)
 {
     switch (state) {
     case LLM_CLIENT_STATE_IDLE:
@@ -54,14 +69,10 @@ static const char *llm_client_state_name(llm_client_state_t state)
         return "ASR_CONNECTING";
     case LLM_CLIENT_STATE_ASR_STREAMING:
         return "ASR_STREAMING";
-    case LLM_CLIENT_STATE_ASR_WAIT_FINAL:
-        return "ASR_WAIT_FINAL";
-    case LLM_CLIENT_STATE_LLM_REQUESTING:
-        return "LLM_REQUESTING";
-    case LLM_CLIENT_STATE_ROUTING:
-        return "ROUTING";
-    case LLM_CLIENT_STATE_ERROR:
-        return "ERROR";
+    case LLM_CLIENT_STATE_ASR_FINISHING:
+        return "ASR_FINISHING";
+    case LLM_CLIENT_STATE_CHAT_REQUESTING:
+        return "CHAT_REQUESTING";
     default:
         return "UNKNOWN";
     }
@@ -97,60 +108,24 @@ static void llm_client_emit(llm_client_event_type_t type,
     s_client.event_cb(&event, s_client.user_ctx);
 }
 
-static void llm_client_free_record_buffer(void)
+static void llm_client_signal_asr_finish(EventBits_t bits)
 {
-    free(s_client.record_buffer);
-    s_client.record_buffer = NULL;
-    s_client.record_sample_count = 0;
-    s_client.record_capacity_samples = 0;
-    s_client.record_overflowed = false;
+    if (s_client.asr_event_group != NULL) {
+        xEventGroupSetBits(s_client.asr_event_group, bits);
+    }
 }
 
-static esp_err_t llm_client_alloc_record_buffer(void)
+static void llm_client_clear_asr_finish_bits(void)
 {
-    llm_client_free_record_buffer();
-
-    size_t capacity_samples = LLM_GATEWAY_RECORD_MAX_BYTES / sizeof(int16_t);
-    size_t bytes = capacity_samples * sizeof(int16_t);
-#if LLM_GATEWAY_USE_PSRAM_RECORD_BUFFER
-    s_client.record_buffer = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_client.record_buffer == NULL) {
-        ESP_LOGW(TAG, "PSRAM record buffer alloc failed, fallback to internal heap");
-        s_client.record_buffer = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    if (s_client.asr_event_group != NULL) {
+        xEventGroupClearBits(s_client.asr_event_group, LLM_CLIENT_ASR_FINISH_BITS);
     }
-#else
-    s_client.record_buffer = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
-#endif
-    if (s_client.record_buffer == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    s_client.record_capacity_samples = capacity_samples;
-    s_client.record_sample_count = 0;
-    s_client.record_overflowed = false;
-    return ESP_OK;
 }
 
-static void llm_client_cache_pcm(const int16_t *pcm, size_t samples)
+static void llm_client_mark_asr_event(void)
 {
-    if (s_client.record_buffer == NULL || pcm == NULL || samples == 0) {
-        return;
-    }
-
-    size_t available = s_client.record_capacity_samples - s_client.record_sample_count;
-    size_t copy_samples = samples < available ? samples : available;
-    if (copy_samples > 0) {
-        memcpy(&s_client.record_buffer[s_client.record_sample_count],
-               pcm,
-               copy_samples * sizeof(int16_t));
-        s_client.record_sample_count += copy_samples;
-    }
-    if (copy_samples < samples && !s_client.record_overflowed) {
-        s_client.record_overflowed = true;
-        ESP_LOGW(TAG,
-                 "ASR fallback record buffer full: capacity_bytes=%u",
-                 (unsigned int)(s_client.record_capacity_samples * sizeof(int16_t)));
-    }
+    s_client.asr_event_count++;
+    s_client.asr_last_event_tick = xTaskGetTickCount();
 }
 
 static void llm_client_reset_voice_session(void)
@@ -159,97 +134,190 @@ static void llm_client_reset_voice_session(void)
         (void)llm_gateway_ws_stop();
         s_client.ws_started = false;
     }
+    llm_client_clear_asr_finish_bits();
     s_client.asr_final_text[0] = '\0';
+    s_client.asr_last_partial_text[0] = '\0';
+    s_client.pending_chat_text[0] = '\0';
     s_client.llm_final_text[0] = '\0';
-    llm_client_free_record_buffer();
+    s_client.asr_event_count = 0;
+    s_client.pcm_packet_count = 0;
+    s_client.asr_final_received = false;
+    s_client.asr_partial_received = false;
     llm_client_set_state(LLM_CLIENT_STATE_IDLE);
 }
 
-static esp_err_t llm_client_route_final_text(void)
+static esp_err_t llm_client_start_asr_final_task(const char *chat_text)
 {
-    if (s_client.llm_final_text[0] == '\0') {
-        return ESP_ERR_NOT_FOUND;
+    if (s_client.asr_final_task_handle != NULL) {
+        ESP_LOGW(TAG, "ASR final task already running");
+        return ESP_OK;
     }
 
-    llm_client_set_state(LLM_CLIENT_STATE_ROUTING);
-    llm_router_result_t result = {0};
-    esp_err_t parse_ret = llm_router_parse_final_text(s_client.llm_final_text, &result);
-    if (parse_ret != ESP_OK) {
-        ESP_LOGW(TAG, "LLM final router parse failed, print raw text only");
-        ESP_LOGI(TAG, "LLM FINAL RAW: %s", s_client.llm_final_text);
-        return parse_ret;
-    }
-
-    esp_err_t handle_ret = llm_router_handle_result(&result);
-    if (handle_ret == ESP_OK) {
-        llm_client_emit(LLM_CLIENT_EVENT_COMMAND_RESULT,
-                        result.reply[0] != '\0' ? result.reply : result.command,
-                        NULL,
-                        0,
-                        0,
-                        "router handled");
+    if (chat_text != NULL && chat_text[0] != '\0') {
+        strlcpy(s_client.pending_chat_text, chat_text, sizeof(s_client.pending_chat_text));
     } else {
-        llm_client_emit(LLM_CLIENT_EVENT_ERROR,
-                        NULL,
-                        NULL,
-                        0,
-                        handle_ret,
-                        "router handle failed");
+        s_client.pending_chat_text[0] = '\0';
     }
-    llm_router_result_cleanup(&result);
-    return handle_ret;
+
+    BaseType_t created = xTaskCreate(llm_client_asr_final_task,
+                                     "llm_asr_final",
+                                     LLM_GATEWAY_CHAT_TASK_STACK_SIZE,
+                                     NULL,
+                                     LLM_GATEWAY_CHAT_TASK_PRIORITY,
+                                     &s_client.asr_final_task_handle);
+    if (created != pdPASS) {
+        s_client.asr_final_task_handle = NULL;
+        s_client.pending_chat_text[0] = '\0';
+        ESP_LOGE(TAG, "create ASR final task failed");
+        if (s_client.ws_started) {
+            (void)llm_gateway_ws_stop();
+            s_client.ws_started = false;
+        }
+        llm_client_set_state(LLM_CLIENT_STATE_IDLE);
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
 }
 
-esp_err_t llm_client_chat_text_with_model(const char *llm_model, const char *user_text)
+static esp_err_t llm_client_run_text_query(const char *system_prompt,
+                                           const char *user_text,
+                                           char *out_reply,
+                                           size_t out_reply_size,
+                                           bool require_idle)
 {
     if (!s_client.initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (llm_model == NULL || llm_model[0] == '\0' ||
-        user_text == NULL || user_text[0] == '\0') {
+    const char *model = llm_client_get_model_name(LLM_CLIENT_CAP_TEXT);
+    if (model == NULL || model[0] == '\0' ||
+        user_text == NULL || user_text[0] == '\0' ||
+        out_reply == NULL || out_reply_size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!LLM_GATEWAY_ENABLE_TEXT) {
+        ESP_LOGW(TAG, "gateway chat reserved but not enabled");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (require_idle && s_client.state != LLM_CLIENT_STATE_IDLE) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
-    llm_client_set_state(LLM_CLIENT_STATE_LLM_REQUESTING);
-    s_client.llm_final_text[0] = '\0';
-    esp_err_t ret = llm_gateway_http_chat_completion(llm_model,
-                                                     s_client.system_prompt,
+    llm_client_set_state(LLM_CLIENT_STATE_CHAT_REQUESTING);
+    out_reply[0] = '\0';
+    esp_err_t ret = llm_gateway_http_chat_completion(model,
+                                                     system_prompt != NULL ? system_prompt : s_client.system_prompt,
                                                      user_text,
-                                                     s_client.llm_final_text,
-                                                     sizeof(s_client.llm_final_text));
+                                                     out_reply,
+                                                     out_reply_size);
     if (ret != ESP_OK) {
         llm_client_emit(LLM_CLIENT_EVENT_ERROR, NULL, NULL, 0, ret, "LLM HTTP request failed");
         llm_client_set_state(LLM_CLIENT_STATE_IDLE);
         return ret;
     }
 
-    if (s_client.llm_final_text[0] == '\0') {
+    if (out_reply[0] == '\0') {
         llm_client_set_state(LLM_CLIENT_STATE_IDLE);
         return ESP_ERR_NOT_FOUND;
     }
 
-    ESP_LOGI(TAG, "LLM FINAL: %s", s_client.llm_final_text);
+    ESP_LOGI(TAG, "LLM FINAL: %s", out_reply);
     llm_client_emit(LLM_CLIENT_EVENT_LLM_FINAL_TEXT,
-                    s_client.llm_final_text,
+                    out_reply,
                     NULL,
                     0,
                     0,
                     NULL);
 
-    ret = llm_client_route_final_text();
     llm_client_set_state(LLM_CLIENT_STATE_IDLE);
-    return ret == ESP_ERR_INVALID_RESPONSE ? ESP_OK : ret;
+    return ESP_OK;
 }
 
-esp_err_t llm_client_chat_text(const char *user_text)
+esp_err_t llm_client_text_query(const char *system_prompt,
+                                const char *user_text,
+                                char *out_reply,
+                                size_t out_reply_size)
 {
-    return llm_client_chat_text_with_model(s_client.llm_model, user_text);
+    return llm_client_run_text_query(system_prompt,
+                                     user_text,
+                                     out_reply,
+                                     out_reply_size,
+                                     true);
+}
+
+esp_err_t llm_client_text_request(const char *user_text)
+{
+    char reply[LLM_GATEWAY_LLM_RESPONSE_MAX_BYTES] = {0};
+    return llm_client_text_query(s_client.system_prompt, user_text, reply, sizeof(reply));
+}
+
+static void llm_client_asr_final_task(void *arg)
+{
+    (void)arg;
+
+    char chat_text[LLM_GATEWAY_ASR_TEXT_MAX_BYTES] = {0};
+    strlcpy(chat_text, s_client.pending_chat_text, sizeof(chat_text));
+
+    if (chat_text[0] == '\0') {
+        ESP_LOGI(TAG, "ASR final text empty, skip Chat");
+    } else if (!LLM_GATEWAY_ENABLE_ASR_TO_CHAT) {
+        ESP_LOGI(TAG, "ASR -> Chat disabled, keep transcript only");
+    } else {
+        const char *model = llm_client_get_model_name(LLM_CLIENT_CAP_TEXT);
+        if (!LLM_GATEWAY_ENABLE_TEXT || model == NULL || model[0] == '\0') {
+            ESP_LOGW(TAG, "gateway chat reserved but not enabled");
+            s_client.pending_chat_text[0] = '\0';
+            s_client.asr_final_task_handle = NULL;
+            vTaskDelete(NULL);
+            return;
+        }
+
+        ESP_LOGI(TAG, "ASR -> Chat: %s", chat_text);
+        s_client.llm_final_text[0] = '\0';
+        esp_err_t ret = llm_gateway_http_chat_completion(model,
+                                                         s_client.system_prompt,
+                                                         chat_text,
+                                                         s_client.llm_final_text,
+                                                         sizeof(s_client.llm_final_text));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "ASR -> Chat failed: %s", esp_err_to_name(ret));
+            if (ret == ESP_ERR_INVALID_RESPONSE) {
+                ESP_LOGW(TAG,
+                         "ASR -> Chat rejected by gateway: check API key Chat permission and model=%s binding",
+                         model);
+            }
+            llm_client_emit(LLM_CLIENT_EVENT_ERROR,
+                            NULL,
+                            NULL,
+                            0,
+                            ret,
+                            "ASR text to Chat failed");
+        } else if (s_client.llm_final_text[0] == '\0') {
+            ESP_LOGW(TAG, "ASR -> Chat completed without reply");
+        } else {
+            ESP_LOGI(TAG, "LLM FINAL: %s", s_client.llm_final_text);
+            llm_client_emit(LLM_CLIENT_EVENT_LLM_FINAL_TEXT,
+                            s_client.llm_final_text,
+                            NULL,
+                            0,
+                            0,
+                            NULL);
+        }
+    }
+
+    s_client.pending_chat_text[0] = '\0';
+    s_client.asr_final_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 static esp_err_t llm_client_handle_asr_final(const char *text)
 {
+    s_client.asr_final_received = true;
+
     if (text == NULL || text[0] == '\0') {
-        llm_client_set_state(LLM_CLIENT_STATE_IDLE);
+        ESP_LOGW(TAG, "ASR completed without transcript");
+        s_client.asr_final_text[0] = '\0';
+        llm_client_signal_asr_finish(LLM_CLIENT_ASR_FINAL_BIT);
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -262,9 +330,70 @@ static esp_err_t llm_client_handle_asr_final(const char *text)
                     0,
                     NULL);
 
-    esp_err_t ret = llm_client_chat_text_with_model(s_client.llm_model, s_client.asr_final_text);
-    llm_client_free_record_buffer();
-    return ret;
+    llm_client_signal_asr_finish(LLM_CLIENT_ASR_FINAL_BIT);
+    return ESP_OK;
+}
+
+static esp_err_t llm_client_start_asr_chat_if_needed(void)
+{
+    if (!s_client.asr_final_received || s_client.asr_final_text[0] == '\0') {
+        ESP_LOGI(TAG, "ASR final text empty, skip Chat");
+        return ESP_OK;
+    }
+    if (!LLM_GATEWAY_ENABLE_ASR_TO_CHAT) {
+        ESP_LOGI(TAG, "ASR -> Chat disabled, keep transcript only");
+        return ESP_OK;
+    }
+
+    return llm_client_start_asr_final_task(s_client.asr_final_text);
+}
+
+static EventBits_t llm_client_wait_asr_finish_events(void)
+{
+    if (s_client.asr_event_group == NULL) {
+        return 0;
+    }
+
+    const TickType_t start_tick = xTaskGetTickCount();
+    const TickType_t deadline_tick = start_tick + pdMS_TO_TICKS(LLM_GATEWAY_WS_FINAL_TIMEOUT_MS);
+    const TickType_t quiet_ticks = pdMS_TO_TICKS(LLM_GATEWAY_WS_DRAIN_QUIET_MS);
+    EventBits_t collected_bits = 0;
+    bool final_seen = false;
+
+    ESP_LOGI(TAG,
+             "ASR finish receive loop start: timeout_ms=%d drain_quiet_ms=%d",
+             LLM_GATEWAY_WS_FINAL_TIMEOUT_MS,
+             LLM_GATEWAY_WS_DRAIN_QUIET_MS);
+
+    while ((int32_t)(deadline_tick - xTaskGetTickCount()) > 0) {
+        TickType_t now = xTaskGetTickCount();
+        TickType_t wait_ticks = pdMS_TO_TICKS(100);
+        TickType_t remaining_ticks = deadline_tick - now;
+        if (remaining_ticks < wait_ticks) {
+            wait_ticks = remaining_ticks;
+        }
+
+        EventBits_t bits = xEventGroupWaitBits(s_client.asr_event_group,
+                                               LLM_CLIENT_ASR_FINISH_BITS,
+                                               pdTRUE,
+                                               pdFALSE,
+                                               wait_ticks);
+        collected_bits |= bits;
+        if (bits & LLM_CLIENT_ASR_FINAL_BIT) {
+            final_seen = true;
+        }
+        if (bits & (LLM_CLIENT_ASR_ERROR_BIT | LLM_CLIENT_ASR_DISCONNECTED_BIT)) {
+            break;
+        }
+
+        now = xTaskGetTickCount();
+        if (final_seen && (now - s_client.asr_last_event_tick) >= quiet_ticks) {
+            ESP_LOGI(TAG, "ASR finish receive loop drained after final");
+            break;
+        }
+    }
+
+    return collected_bits;
 }
 
 static void llm_client_ws_event_cb(const llm_gateway_ws_event_t *event, void *user_ctx)
@@ -276,12 +405,22 @@ static void llm_client_ws_event_cb(const llm_gateway_ws_event_t *event, void *us
 
     switch (event->type) {
     case LLM_GATEWAY_WS_EVENT_CONNECTED:
+        llm_client_mark_asr_event();
         llm_client_emit(LLM_CLIENT_EVENT_CONNECTED, NULL, NULL, 0, 0, NULL);
         break;
     case LLM_GATEWAY_WS_EVENT_DISCONNECTED:
+        llm_client_mark_asr_event();
         llm_client_emit(LLM_CLIENT_EVENT_DISCONNECTED, NULL, NULL, 0, 0, NULL);
+        if (s_client.state == LLM_CLIENT_STATE_ASR_FINISHING) {
+            llm_client_signal_asr_finish(LLM_CLIENT_ASR_DISCONNECTED_BIT);
+        }
         break;
     case LLM_GATEWAY_WS_EVENT_ASR_PARTIAL:
+        llm_client_mark_asr_event();
+        if (event->text != NULL && event->text[0] != '\0') {
+            strlcpy(s_client.asr_last_partial_text, event->text, sizeof(s_client.asr_last_partial_text));
+            s_client.asr_partial_received = true;
+        }
         llm_client_emit(LLM_CLIENT_EVENT_ASR_PARTIAL_TEXT,
                         event->text,
                         NULL,
@@ -290,28 +429,26 @@ static void llm_client_ws_event_cb(const llm_gateway_ws_event_t *event, void *us
                         event->message);
         break;
     case LLM_GATEWAY_WS_EVENT_ASR_FINAL:
+        llm_client_mark_asr_event();
         if (s_client.state == LLM_CLIENT_STATE_ASR_STREAMING ||
-            s_client.state == LLM_CLIENT_STATE_ASR_WAIT_FINAL) {
+            s_client.state == LLM_CLIENT_STATE_ASR_FINISHING) {
             (void)llm_client_handle_asr_final(event->text);
         }
         break;
-    case LLM_GATEWAY_WS_EVENT_TTS_AUDIO:
-        llm_client_emit(LLM_CLIENT_EVENT_TTS_AUDIO,
-                        NULL,
-                        NULL,
-                        event->audio_len,
-                        event->code,
-                        "audio delta ignored, TTS disabled");
-        break;
     case LLM_GATEWAY_WS_EVENT_ERROR:
     default:
+        llm_client_mark_asr_event();
         llm_client_emit(LLM_CLIENT_EVENT_ERROR,
                         NULL,
                         NULL,
                         0,
                         event->code,
                         event->message != NULL ? event->message : "ASR WS error");
-        llm_client_set_state(LLM_CLIENT_STATE_ERROR);
+        if (s_client.state == LLM_CLIENT_STATE_ASR_FINISHING) {
+            llm_client_signal_asr_finish(LLM_CLIENT_ASR_ERROR_BIT);
+        } else {
+            llm_client_reset_voice_session();
+        }
         break;
     }
 }
@@ -321,17 +458,16 @@ esp_err_t llm_client_init(const llm_client_config_t *config)
     if (s_client.initialized) {
         return ESP_OK;
     }
-    if (config == NULL ||
-        config->asr_model == NULL || config->asr_model[0] == '\0' ||
-        config->llm_model == NULL || config->llm_model[0] == '\0') {
+    if (config == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
     memset(&s_client, 0, sizeof(s_client));
+    s_client.asr_event_group = xEventGroupCreate();
+    if (s_client.asr_event_group == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     s_client.state = LLM_CLIENT_STATE_IDLE;
-    s_client.asr_model = config->asr_model;
-    s_client.llm_model = config->llm_model;
-    s_client.tts_model = config->tts_model;
     s_client.system_prompt = (config->system_prompt != NULL) ?
         config->system_prompt : LLM_GATEWAY_SYSTEM_PROMPT;
     s_client.event_cb = config->event_cb;
@@ -353,38 +489,51 @@ esp_err_t llm_client_deinit(void)
         return ESP_OK;
     }
     llm_client_reset_voice_session();
+    if (s_client.asr_event_group != NULL) {
+        vEventGroupDelete(s_client.asr_event_group);
+        s_client.asr_event_group = NULL;
+    }
     memset(&s_client, 0, sizeof(s_client));
     return ESP_OK;
 }
 
-esp_err_t llm_client_start_voice_session(void)
+esp_err_t llm_client_start_asr_session(void)
 {
     if (!s_client.initialized) {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_client.state != LLM_CLIENT_STATE_IDLE) {
+        if (s_client.state == LLM_CLIENT_STATE_ASR_FINISHING) {
+            ESP_LOGI(TAG, "ASR busy finishing previous session");
+        } else {
+            ESP_LOGW(TAG, "ASR start rejected: state=%s", llm_client_state_name(s_client.state));
+        }
         return ESP_ERR_INVALID_STATE;
     }
-
-    esp_err_t ret = llm_client_alloc_record_buffer();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "ASR fallback PCM cache unavailable: %s", esp_err_to_name(ret));
+    const char *asr_model = llm_client_get_model_name(LLM_CLIENT_CAP_ASR);
+    if (!LLM_GATEWAY_ENABLE_ASR || asr_model == NULL || asr_model[0] == '\0') {
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
+    llm_client_clear_asr_finish_bits();
+    s_client.asr_final_received = false;
+    s_client.asr_partial_received = false;
+    s_client.asr_final_text[0] = '\0';
+    s_client.asr_last_partial_text[0] = '\0';
+    s_client.asr_event_count = 0;
+    s_client.pcm_packet_count = 0;
+    s_client.asr_last_event_tick = xTaskGetTickCount();
     llm_client_set_state(LLM_CLIENT_STATE_ASR_CONNECTING);
     llm_gateway_ws_config_t ws_config = {
-        .asr_model = s_client.asr_model,
+        .asr_model = asr_model,
         .event_cb = llm_client_ws_event_cb,
         .user_ctx = NULL,
     };
-    ret = llm_gateway_ws_start(&ws_config);
+    esp_err_t ret = llm_gateway_ws_start(&ws_config);
     if (ret != ESP_OK) {
         llm_client_emit(LLM_CLIENT_EVENT_ERROR, NULL, NULL, 0, ret, "ASR WebSocket start failed");
-        if (!LLM_GATEWAY_ASR_HTTP_FALLBACK || s_client.record_buffer == NULL) {
-            llm_client_reset_voice_session();
-            return ret;
-        }
-        ESP_LOGW(TAG, "ASR WebSocket failed, will use HTTP fallback at voice_end");
+        llm_client_reset_voice_session();
+        return ret;
     } else {
         s_client.ws_started = true;
     }
@@ -393,7 +542,7 @@ esp_err_t llm_client_start_voice_session(void)
     return ESP_OK;
 }
 
-esp_err_t llm_client_send_audio_pcm16(const int16_t *pcm, size_t samples, uint32_t sample_rate_hz)
+esp_err_t llm_client_send_asr_pcm(const int16_t *pcm, size_t samples)
 {
     if (!s_client.initialized) {
         return ESP_ERR_INVALID_STATE;
@@ -401,89 +550,127 @@ esp_err_t llm_client_send_audio_pcm16(const int16_t *pcm, size_t samples, uint32
     if (pcm == NULL || samples == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (sample_rate_hz != LLM_GATEWAY_AUDIO_SAMPLE_RATE) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (s_client.state != LLM_CLIENT_STATE_ASR_STREAMING) {
+    if (s_client.state != LLM_CLIENT_STATE_ASR_CONNECTING &&
+        s_client.state != LLM_CLIENT_STATE_ASR_STREAMING) {
+        ESP_LOGW(TAG,
+                 "ASR PCM drop: pcm_bytes=%u sample_rate=%d channels=%d llm_client_state=%s",
+                 (unsigned int)(samples * sizeof(int16_t)),
+                 LLM_GATEWAY_AUDIO_SAMPLE_RATE,
+                 LLM_GATEWAY_AUDIO_CHANNELS,
+                 llm_client_state_name(s_client.state));
         return ESP_ERR_INVALID_STATE;
     }
 
-    llm_client_cache_pcm(pcm, samples);
-
     if (!s_client.ws_started) {
+        ESP_LOGW(TAG,
+                 "ASR PCM drop: websocket not started, pcm_bytes=%u llm_client_state=%s",
+                 (unsigned int)(samples * sizeof(int16_t)),
+                 llm_client_state_name(s_client.state));
         return ESP_OK;
     }
 
-    esp_err_t ret = llm_gateway_ws_send_pcm16(pcm, samples, sample_rate_hz);
-    if (ret != ESP_OK && LLM_GATEWAY_ASR_HTTP_FALLBACK) {
-        ESP_LOGW(TAG, "ASR WS PCM send failed, keep recording for HTTP fallback: %s", esp_err_to_name(ret));
+    s_client.pcm_packet_count++;
+    esp_err_t ret = llm_gateway_ws_send_pcm16(pcm, samples, LLM_GATEWAY_AUDIO_SAMPLE_RATE);
+    if ((s_client.pcm_packet_count % 10U) == 0U || ret != ESP_OK) {
+        ESP_LOGI(TAG,
+                 "ASR PCM send: pcm_packet_count=%u pcm_bytes=%u sample_rate=%d channels=%d send_result=%s llm_client_state=%s",
+                 (unsigned int)s_client.pcm_packet_count,
+                 (unsigned int)(samples * sizeof(int16_t)),
+                 LLM_GATEWAY_AUDIO_SAMPLE_RATE,
+                 LLM_GATEWAY_AUDIO_CHANNELS,
+                 esp_err_to_name(ret),
+                 llm_client_state_name(s_client.state));
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ASR WS PCM send failed: %s", esp_err_to_name(ret));
         (void)llm_gateway_ws_stop();
         s_client.ws_started = false;
-        return ESP_OK;
+        llm_client_reset_voice_session();
     }
     return ret;
 }
 
-esp_err_t llm_client_finish_voice_session(void)
+esp_err_t llm_client_finish_asr_session(void)
 {
     if (!s_client.initialized) {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_client.state != LLM_CLIENT_STATE_ASR_STREAMING &&
-        s_client.state != LLM_CLIENT_STATE_ASR_WAIT_FINAL &&
-        s_client.state != LLM_CLIENT_STATE_LLM_REQUESTING &&
-        s_client.state != LLM_CLIENT_STATE_ROUTING) {
+        s_client.state != LLM_CLIENT_STATE_ASR_FINISHING) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    if (s_client.state == LLM_CLIENT_STATE_LLM_REQUESTING ||
-        s_client.state == LLM_CLIENT_STATE_ROUTING) {
+    if (s_client.state == LLM_CLIENT_STATE_ASR_FINISHING) {
         return ESP_OK;
     }
 
-    llm_client_set_state(LLM_CLIENT_STATE_ASR_WAIT_FINAL);
-    esp_err_t ret = ESP_OK;
+    llm_client_clear_asr_finish_bits();
+    s_client.asr_final_received = false;
+    s_client.asr_final_text[0] = '\0';
+    llm_client_set_state(LLM_CLIENT_STATE_ASR_FINISHING);
+    esp_err_t finish_ret = ESP_OK;
     if (s_client.ws_started) {
-        ret = llm_gateway_ws_finish();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "ASR WS finish failed: %s", esp_err_to_name(ret));
+        finish_ret = llm_gateway_ws_finish();
+        ESP_LOGI(TAG, "ASR finalize send result: %s", esp_err_to_name(finish_ret));
+        if (finish_ret != ESP_OK) {
+            ESP_LOGW(TAG, "ASR WS finish failed: %s", esp_err_to_name(finish_ret));
+        }
+    } else {
+        ESP_LOGW(TAG, "ASR finalize skipped: websocket not started");
+    }
+
+    EventBits_t bits = 0;
+    if (finish_ret == ESP_OK && s_client.asr_event_group != NULL) {
+        s_client.asr_last_event_tick = xTaskGetTickCount();
+        bits = llm_client_wait_asr_finish_events();
+    }
+
+    if (bits & LLM_CLIENT_ASR_FINAL_BIT) {
+        ESP_LOGI(TAG, "ASR final transcript receive result: received");
+    } else if (bits & LLM_CLIENT_ASR_ERROR_BIT) {
+        ESP_LOGW(TAG, "ASR final transcript receive result: websocket error");
+    } else if (bits & LLM_CLIENT_ASR_DISCONNECTED_BIT) {
+        ESP_LOGW(TAG, "ASR final transcript receive result: disconnected before final");
+    } else if (finish_ret == ESP_OK) {
+        ESP_LOGW(TAG,
+                 "ASR final transcript receive result: timeout after %d ms",
+                 LLM_GATEWAY_WS_FINAL_TIMEOUT_MS);
+        if (s_client.asr_partial_received && s_client.asr_last_partial_text[0] != '\0') {
+            ESP_LOGI(TAG, "ASR timeout with latest partial transcript: %s", s_client.asr_last_partial_text);
         }
     }
 
-    if (s_client.asr_final_text[0] != '\0') {
-        llm_client_reset_voice_session();
-        return ESP_OK;
-    }
-
-    if (LLM_GATEWAY_ASR_HTTP_FALLBACK &&
-        s_client.record_buffer != NULL &&
-        s_client.record_sample_count > 0) {
-        char fallback_text[LLM_GATEWAY_ASR_TEXT_MAX_BYTES] = {0};
-        ESP_LOGI(TAG,
-                 "ASR HTTP fallback: samples=%u overflow=%d",
-                 (unsigned int)s_client.record_sample_count,
-                 s_client.record_overflowed);
-        ret = llm_gateway_http_asr_transcription(s_client.asr_model,
-                                                 s_client.record_buffer,
-                                                 s_client.record_sample_count,
-                                                 LLM_GATEWAY_AUDIO_SAMPLE_RATE,
-                                                 fallback_text,
-                                                 sizeof(fallback_text));
-        if (ret == ESP_OK && fallback_text[0] != '\0') {
-            ret = llm_client_handle_asr_final(fallback_text);
-        }
-    }
-
+    esp_err_t close_ret = ESP_OK;
     if (s_client.ws_started) {
-        (void)llm_gateway_ws_stop();
+        close_ret = llm_gateway_ws_stop();
         s_client.ws_started = false;
+        if (close_ret == ESP_OK) {
+            ESP_LOGI(TAG, "ASR WebSocket close result: %s", esp_err_to_name(close_ret));
+        } else {
+            ESP_LOGW(TAG,
+                     "ASR WebSocket close result: %s, session resources cleaned",
+                     esp_err_to_name(close_ret));
+        }
     }
-    llm_client_free_record_buffer();
+
     llm_client_set_state(LLM_CLIENT_STATE_IDLE);
-    return ret;
+
+    if (s_client.asr_final_received && s_client.asr_final_text[0] != '\0') {
+        esp_err_t chat_ret = llm_client_start_asr_chat_if_needed();
+        if (chat_ret != ESP_OK) {
+            ESP_LOGW(TAG, "start ASR -> Chat task failed: %s", esp_err_to_name(chat_ret));
+            llm_client_emit(LLM_CLIENT_EVENT_ERROR,
+                            NULL,
+                            NULL,
+                            0,
+                            chat_ret,
+                            "start ASR text to Chat failed");
+        }
+    }
+
+    return ESP_OK;
 }
 
-esp_err_t llm_client_stop_voice_session(void)
+esp_err_t llm_client_cancel_asr_session(void)
 {
     if (!s_client.initialized) {
         return ESP_ERR_INVALID_STATE;
@@ -498,19 +685,42 @@ bool llm_client_is_voice_session_active(void)
     return s_client.initialized && s_client.state != LLM_CLIENT_STATE_IDLE;
 }
 
+llm_client_state_t llm_client_get_state(void)
+{
+    return s_client.state;
+}
+
+esp_err_t llm_client_start_voice_session(void)
+{
+    return llm_client_start_asr_session();
+}
+
+esp_err_t llm_client_send_audio_pcm16(const int16_t *pcm, size_t samples, uint32_t sample_rate_hz)
+{
+    if (sample_rate_hz != LLM_GATEWAY_AUDIO_SAMPLE_RATE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return llm_client_send_asr_pcm(pcm, samples);
+}
+
+esp_err_t llm_client_finish_voice_session(void)
+{
+    return llm_client_finish_asr_session();
+}
+
+esp_err_t llm_client_stop_voice_session(void)
+{
+    return llm_client_cancel_asr_session();
+}
+
 esp_err_t llm_client_chat_json_context(const char *json_context)
 {
-    return llm_client_chat_text(json_context);
+    return llm_client_text_request(json_context);
 }
 
-esp_err_t llm_client_chat_json_context_with_model(const char *llm_model, const char *json_context)
+esp_err_t llm_client_json_context_request(const char *source, const char *json_context)
 {
-    return llm_client_chat_text_with_model(llm_model, json_context);
-}
-
-esp_err_t llm_client_send_sensor_json_with_model(const char *source, const char *json, const char *llm_model)
-{
-    if (source == NULL || source[0] == '\0' || json == NULL || json[0] == '\0') {
+    if (source == NULL || source[0] == '\0' || json_context == NULL || json_context[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -519,37 +729,36 @@ esp_err_t llm_client_send_sensor_json_with_model(const char *source, const char 
                            sizeof(context),
                            "{\"source\":\"%s\",\"data\":%s}",
                            source,
-                           json);
+                           json_context);
     if (written < 0 || (size_t)written >= sizeof(context)) {
         return ESP_ERR_INVALID_SIZE;
     }
-    ESP_LOGI(TAG, "sensor JSON reserved: source=%s len=%u", source, (unsigned int)strlen(json));
-    return llm_client_chat_json_context_with_model(llm_model, context);
-}
-
-esp_err_t llm_client_send_sensor_json(const char *source, const char *json)
-{
-    return llm_client_send_sensor_json_with_model(source, json, s_client.llm_model);
+    ESP_LOGI(TAG, "JSON context request: source=%s len=%u", source, (unsigned int)strlen(json_context));
+    return llm_client_text_request(context);
 }
 
 esp_err_t llm_client_send_bme690_json(const char *json)
 {
-    return llm_client_send_sensor_json("bme690", json);
+    return llm_client_json_context_request("bme690", json);
 }
 
 esp_err_t llm_client_send_csi_json(const char *json)
 {
-    return llm_client_send_sensor_json("csi", json);
+    return llm_client_json_context_request("csi", json);
 }
 
 esp_err_t llm_client_send_system_status_json(const char *json)
 {
-    return llm_client_send_sensor_json("system_status", json);
+    return llm_client_json_context_request("system_status", json);
 }
 
 esp_err_t llm_client_tts_text(const char *text)
 {
     if (text == NULL || text[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const char *model = llm_client_get_model_name(LLM_CLIENT_CAP_TTS);
+    if (model == NULL || model[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
     ESP_LOGI(TAG, "TTS disabled, skip text_len=%u", (unsigned int)strlen(text));

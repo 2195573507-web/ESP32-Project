@@ -1,6 +1,8 @@
 #ifndef BME690_LLM_BRIDGE_H
 #define BME690_LLM_BRIDGE_H
 
+#include <stddef.h>
+
 #include "esp_err.h"
 
 /**
@@ -10,9 +12,6 @@
  * 调用方法：BME690 模块只调用本文件，不直接依赖 llm_client 或网关协议细节。
  * 当前阶段仅提供 JSON 上下文入口，不主动采集传感器。
  */
-
-/* BME690 模型配置：模型名归属 BME690 bridge，llm 层只负责转发到网关。 */
-#define BME690_LLM_BRIDGE_LLM_MODEL            "请填入BME690_LLM模型名"           // BME690 传感器上下文使用的 LLM 模型。
 
 /**
  * @brief 初始化 BME690 LLM bridge。
@@ -44,5 +43,27 @@ esp_err_t bme690_llm_bridge_send_reading(float temperature,
                                          float humidity,
                                          float pressure,
                                          float gas_resistance);
+
+esp_err_t ai_bme690_bridge_init(void);
+esp_err_t ai_bme690_bridge_report(float temperature_c,
+                                  float humidity_rh,
+                                  float pressure_hpa,
+                                  float gas_resistance_ohm,
+                                  float iaq);
+esp_err_t ai_bme690_bridge_ask(float temperature_c,
+                               float humidity_rh,
+                               float pressure_hpa,
+                               float gas_resistance_ohm,
+                               float iaq,
+                               const char *question,
+                               char *out_reply,
+                               size_t out_reply_size);
+esp_err_t ai_bme690_bridge_build_context(float temperature_c,
+                                         float humidity_rh,
+                                         float pressure_hpa,
+                                         float gas_resistance_ohm,
+                                         float iaq,
+                                         char *out_context,
+                                         size_t out_context_size);
 
 #endif // BME690_LLM_BRIDGE_H

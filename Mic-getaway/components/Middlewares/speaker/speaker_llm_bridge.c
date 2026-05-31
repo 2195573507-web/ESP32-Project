@@ -19,8 +19,8 @@ esp_err_t speaker_llm_bridge_speak_text(const char *text)
         return ESP_ERR_INVALID_ARG;
     }
 
-    ESP_LOGI(TAG, "TTS disabled, skip speak_text len=%u", (unsigned int)strlen(text));
-    return ESP_ERR_NOT_SUPPORTED;
+    ESP_LOGI(TAG, "speaker speak_text request len=%u", (unsigned int)strlen(text));
+    return llm_client_tts_text(text);
 }
 
 bool speaker_llm_bridge_is_enabled(void)

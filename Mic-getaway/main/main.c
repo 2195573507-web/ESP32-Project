@@ -51,7 +51,7 @@ void app_main(void)
      * WiFi 稳定后初始化 Mic bridge。Mic 只通过 bridge 调用 llm_client，不直接依赖
      * 网关 HTTP、WebSocket 或协议细节。
      */
-    esp_err_t llm_ret = mic_llm_bridge_init();
+    esp_err_t llm_ret = ai_mic_bridge_init();
     if (llm_ret != ESP_OK) {
         ESP_LOGE(TAG, "Mic LLM bridge init failed: %s", esp_err_to_name(llm_ret));
     }

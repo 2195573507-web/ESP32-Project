@@ -17,16 +17,30 @@
  */
 
 typedef enum {
+    LLM_CLIENT_STATE_IDLE = 0,        // 空闲态，可启动下一轮 ASR。
+    LLM_CLIENT_STATE_ASR_CONNECTING,  // 正在建立 ASR WebSocket。
+    LLM_CLIENT_STATE_ASR_STREAMING,   // ASR 已连接，允许发送 PCM。
+    LLM_CLIENT_STATE_ASR_FINISHING,   // 已发送 commit，等待 final 或关闭。
+    LLM_CLIENT_STATE_CHAT_REQUESTING, // 显式 Chat 请求中；ASR final 自动 Chat 在后台任务中发送。
+} llm_client_state_t;
+
+typedef enum {
     LLM_CLIENT_EVENT_CONNECTED = 0,   // 网关连接成功。
     LLM_CLIENT_EVENT_DISCONNECTED,    // 网关连接断开或会话停止。
     LLM_CLIENT_EVENT_ASR_PARTIAL_TEXT, // ASR partial 文本，仅用于日志展示。
-    LLM_CLIENT_EVENT_ASR_FINAL_TEXT,   // ASR final 文本，会继续进入 LLM。
+    LLM_CLIENT_EVENT_ASR_FINAL_TEXT,   // ASR final 文本，先打印/回调，再按配置自动 Chat。
     LLM_CLIENT_EVENT_LLM_DELTA_TEXT,   // LLM 增量文本占位，当前未启用流式 LLM。
     LLM_CLIENT_EVENT_LLM_FINAL_TEXT,   // LLM final 文本。
     LLM_CLIENT_EVENT_COMMAND_RESULT,   // router 已处理 command/speech 结果。
     LLM_CLIENT_EVENT_TTS_AUDIO,        // TTS 音频占位，当前忽略。
     LLM_CLIENT_EVENT_ERROR,            // 网关、解析或 router 错误。
 } llm_client_event_type_t;
+
+typedef enum {
+    LLM_CLIENT_CAP_ASR = 0, // Mic 语音识别能力，对应 LLM_GATEWAY_ASR_MODEL。
+    LLM_CLIENT_CAP_TEXT,    // 文本理解/命令决策能力，对应 LLM_GATEWAY_TEXT_MODEL。
+    LLM_CLIENT_CAP_TTS,     // 语音合成能力，对应 LLM_GATEWAY_TTS_MODEL，当前禁用。
+} llm_client_capability_t;
 
 typedef struct {
     llm_client_event_type_t type; // 事件类型。
@@ -40,9 +54,6 @@ typedef struct {
 typedef void (*llm_client_event_cb_t)(const llm_client_event_t *event, void *user_ctx);
 
 typedef struct {
-    const char *asr_model;            // 当前 bridge 使用的 ASR 模型名，不能为空。
-    const char *llm_model;            // 当前 bridge 使用的 LLM 模型名，不能为空。
-    const char *tts_model;            // 当前 bridge 使用的 TTS 模型名，可为空。
     const char *system_prompt;        // LLM system prompt；为空时使用 LLM_GATEWAY_SYSTEM_PROMPT。
     llm_client_event_cb_t event_cb;   // 事件回调，可为空。
     void *user_ctx;                   // 回调用户上下文。
@@ -61,44 +72,42 @@ esp_err_t llm_client_init(const llm_client_config_t *config);
 /**
  * @brief 反初始化统一 LLM 网关客户端。
  *
- * 调用方法：需要关闭当前语音会话并释放 fallback 录音缓存时调用。
+ * 调用方法：需要关闭当前语音会话并释放 WebSocket 资源时调用。
  *
  * @return 成功返回 ESP_OK。
  */
 esp_err_t llm_client_deinit(void);
 
 /**
- * @brief 开始一次语音会话。
+ * @brief 开始一次 ASR 会话。
  *
- * 调用方法：Mic VAD 触发 VOICE_START 后调用。默认启动 ASR WebSocket streaming，
- * 并准备一份 PCM fallback 缓存。
+ * 调用方法：Mic VAD 触发 VOICE_START 后调用。默认启动 ASR WebSocket streaming。
  *
- * @return 成功返回 ESP_OK；WebSocket 建连失败且不允许 fallback 时返回错误码。
+ * @return 成功返回 ESP_OK；WebSocket 建连失败时返回错误码。
  */
-esp_err_t llm_client_start_voice_session(void);
+esp_err_t llm_client_start_asr_session(void);
 
 /**
  * @brief 发送一段 PCM16 音频到当前语音会话。
  *
  * 调用方法：Mic 采集任务持续调用。pcm 必须是 signed int16、单声道 PCM，
- * sample_rate_hz 必须等于 LLM_GATEWAY_AUDIO_SAMPLE_RATE。
+ * 采样率由当前 Mic 链路固定为 LLM_GATEWAY_AUDIO_SAMPLE_RATE。
  *
  * @param pcm PCM16 样本指针，不能为空。
  * @param samples 样本数，必须大于 0。
- * @param sample_rate_hz PCM 采样率。
  * @return 成功返回 ESP_OK；会话未启动、参数错误或发送失败时返回错误码。
  */
-esp_err_t llm_client_send_audio_pcm16(const int16_t *pcm, size_t samples, uint32_t sample_rate_hz);
+esp_err_t llm_client_send_asr_pcm(const int16_t *pcm, size_t samples);
 
 /**
- * @brief 结束当前语音会话并进入 ASR final -> LLM -> router 链路。
+ * @brief 结束当前 ASR 会话。
  *
- * 调用方法：Mic VAD 触发 VOICE_END 后调用一次。若 streaming 没有 final 且允许
- * HTTP fallback，会使用本地缓存的 PCM 再走一次 HTTP ASR。
+ * 调用方法：Mic VAD 触发 VOICE_END 后调用一次。函数会发送
+ * input_audio_buffer.commit，等待 final 或超时，然后关闭本轮 WebSocket 并回到 IDLE。
  *
- * @return 成功返回 ESP_OK；ASR/LLM/router 任一阶段失败时返回错误码。
+ * @return 收尾完成返回 ESP_OK；commit 或关闭失败时返回错误码，但状态仍会回到 IDLE。
  */
-esp_err_t llm_client_finish_voice_session(void);
+esp_err_t llm_client_finish_asr_session(void);
 
 /**
  * @brief 停止当前语音会话并释放资源。
@@ -107,7 +116,22 @@ esp_err_t llm_client_finish_voice_session(void);
  *
  * @return 成功返回 ESP_OK。
  */
-esp_err_t llm_client_stop_voice_session(void);
+esp_err_t llm_client_cancel_asr_session(void);
+
+/**
+ * @brief 查询 llm_client 当前状态。
+ *
+ * @return 当前状态枚举。
+ */
+llm_client_state_t llm_client_get_state(void);
+
+/**
+ * @brief 获取状态名。
+ *
+ * @param state 状态枚举。
+ * @return 状态字符串。
+ */
+const char *llm_client_state_name(llm_client_state_t state);
 
 /**
  * @brief 查询当前是否存在活动语音会话。
@@ -116,26 +140,33 @@ esp_err_t llm_client_stop_voice_session(void);
  */
 bool llm_client_is_voice_session_active(void);
 
+/* 兼容旧 Mic bridge 命名：Mic 仍只推 ASR，ASR final 后的 Chat 由 llm_client 编排。 */
+esp_err_t llm_client_start_voice_session(void);
+esp_err_t llm_client_send_audio_pcm16(const int16_t *pcm, size_t samples, uint32_t sample_rate_hz);
+esp_err_t llm_client_finish_voice_session(void);
+esp_err_t llm_client_stop_voice_session(void);
+
 /**
  * @brief 直接发送文本到 LLM chat。
  *
- * 调用方法：非语音入口或 bridge 需要直接提问时调用；返回文本会继续进入 router。
+ * 调用方法：非语音入口或 bridge 需要直接提问时调用；ASR final 自动 Chat
+ * 也复用同一套底层 HTTP Chat 实现。
  *
  * @param user_text 用户文本，不能为空。
- * @return 成功返回 ESP_OK；HTTP 请求或 router 失败时返回错误码。
+ * @return 成功返回 ESP_OK；当前 Chat 未启用时返回 ESP_ERR_NOT_SUPPORTED。
  */
-esp_err_t llm_client_chat_text(const char *user_text);
+esp_err_t llm_client_text_request(const char *user_text);
 
 /**
- * @brief 使用指定模型直接发送文本到 LLM chat。
+ * @brief 显式文本查询接口。
  *
- * 调用方法：各 bridge 需要使用本模块专属模型时调用；返回文本会继续进入 router。
- *
- * @param llm_model LLM 模型名，不能为空。
- * @param user_text 用户文本，不能为空。
- * @return 成功返回 ESP_OK；HTTP 请求或 router 失败时返回错误码。
+ * 调用方法：BME690/CSI/System 等 bridge 后续需要 Chat 决策时主动调用。
+ * Mic ASR final 的自动 Chat 由 llm_client 内部任务触发。
  */
-esp_err_t llm_client_chat_text_with_model(const char *llm_model, const char *user_text);
+esp_err_t llm_client_text_query(const char *system_prompt,
+                                const char *user_text,
+                                char *out_reply,
+                                size_t out_reply_size);
 
 /**
  * @brief 发送 JSON 上下文到 LLM chat。
@@ -148,36 +179,16 @@ esp_err_t llm_client_chat_text_with_model(const char *llm_model, const char *use
 esp_err_t llm_client_chat_json_context(const char *json_context);
 
 /**
- * @brief 使用指定模型发送 JSON 上下文到 LLM chat。
+ * @brief 发送模块 JSON 上下文到文本理解/命令决策模型。
  *
- * 调用方法：传感器/系统 bridge 需要使用本模块专属模型时调用。
- *
- * @param llm_model LLM 模型名，不能为空。
- * @param json_context JSON 文本，不能为空。
- * @return 成功返回 ESP_OK；参数错误或 LLM 请求失败时返回错误码。
- */
-esp_err_t llm_client_chat_json_context_with_model(const char *llm_model, const char *json_context);
-
-/**
- * @brief 发送传感器 JSON 上下文到 LLM。
+ * 调用方法：BME690、CSI、System 等模块统一调用本函数或对应便捷函数；
+ * llm_client 内部固定使用 LLM_CLIENT_CAP_TEXT。
  *
  * @param source 传感器来源名，不能为空。
  * @param json 传感器 JSON，不能为空。
  * @return 成功返回 ESP_OK；参数错误或 LLM 请求失败时返回错误码。
  */
-esp_err_t llm_client_send_sensor_json(const char *source, const char *json);
-
-/**
- * @brief 使用指定模型发送传感器 JSON 上下文到 LLM。
- *
- * 调用方法：各传感器 bridge 应优先调用本函数并传入本模块自己的模型名宏。
- *
- * @param source 传感器来源名，不能为空。
- * @param json 传感器 JSON，不能为空。
- * @param llm_model LLM 模型名，不能为空。
- * @return 成功返回 ESP_OK；参数错误或 LLM 请求失败时返回错误码。
- */
-esp_err_t llm_client_send_sensor_json_with_model(const char *source, const char *json, const char *llm_model);
+esp_err_t llm_client_json_context_request(const char *source, const char *json_context);
 
 /**
  * @brief 发送 BME690 JSON 上下文到 LLM。

@@ -13,9 +13,6 @@
  * 当前阶段提供本机 heap、WiFi、语音会话和 TTS 状态 JSON。
  */
 
-/* system 模型配置：模型名归属 system bridge，llm 层只负责转发到网关。 */
-#define SYSTEM_LLM_BRIDGE_LLM_MODEL            "请填入System_LLM模型名"           // 系统状态上下文使用的 LLM 模型。
-
 /**
  * @brief 初始化 system LLM bridge。
  *
@@ -42,5 +39,23 @@ esp_err_t system_llm_bridge_get_status_json(char *out, size_t out_size);
  * @return 成功返回 ESP_OK；状态 JSON 生成或 LLM 请求失败时返回错误码。
  */
 esp_err_t system_llm_bridge_send_status_to_llm(void);
+
+typedef struct {
+    size_t free_heap;       // 当前可用 heap。
+    size_t min_free_heap;   // 历史最小可用 heap。
+    size_t free_psram;      // 当前可用 PSRAM；无 PSRAM 时为 0。
+    int wifi_connected;     // WiFi 是否已连接。
+    int asr_active;         // ASR 是否活动。
+    int llm_state;          // llm_client_state_t 数值。
+} ai_system_snapshot_t;
+
+esp_err_t ai_system_bridge_init(void);
+esp_err_t ai_system_bridge_get_snapshot(ai_system_snapshot_t *snapshot);
+esp_err_t ai_system_bridge_build_context(const ai_system_snapshot_t *snapshot,
+                                         char *out_context,
+                                         size_t out_context_size);
+esp_err_t ai_system_bridge_context_query(const char *question,
+                                         char *out_reply,
+                                         size_t out_reply_size);
 
 #endif // SYSTEM_LLM_BRIDGE_H

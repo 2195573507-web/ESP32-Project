@@ -10,7 +10,7 @@
 
 /**
  * @file llm_gateway_protocol.h
- * @brief 豆包边缘网关 URL、鉴权 Header 和 JSON 协议封装。
+ * @brief 火山引擎边缘网关 URL、鉴权 Header 和 JSON 协议封装。
  *
  * 调用方法：只允许 llm_client、llm_gateway_http 和 llm_gateway_ws 调用本文件接口。
  * 上层 bridge 不直接组装网关 JSON，也不直接读取 API Key。
@@ -21,6 +21,7 @@ typedef struct {
     bool is_final;                                // true 表示 ASR final 文本。
     bool is_error;                                // true 表示服务端错误事件。
     bool has_audio;                               // true 表示事件带音频，当前仅占位。
+    char type[96];                                // 服务端事件 type/event 名。
     char text[LLM_GATEWAY_ASR_TEXT_MAX_BYTES];    // ASR 文本。
     char message[160];                            // 服务端错误/状态说明。
     int code;                                     // 服务端状态码或本地错误码。
@@ -28,23 +29,9 @@ typedef struct {
 } llm_gateway_asr_event_t;
 
 /**
- * @brief 拼接网关 base URL 和 API path。
- *
- * @param base_url 网关根地址，不能为空。
- * @param path API path，不能为空。
- * @param out 输出 URL 缓冲区，不能为空。
- * @param out_size out 字节数，必须大于 0。
- * @return 成功返回 ESP_OK；参数错误或缓冲不足时返回错误码。
- */
-esp_err_t llm_gateway_protocol_build_url(const char *base_url,
-                                         const char *path,
-                                         char *out,
-                                         size_t out_size);
-
-/**
  * @brief 生成 Authorization Header 值。
  *
- * 调用方法：内部使用 LLM_GATEWAY_AUTH_BEARER_PREFIX 和 LLM_GATEWAY_API_KEY；
+ * 调用方法：内部使用 LLM_GATEWAY_AUTH_BEARER_PREFIX 和 VOLC_GATEWAY_API_KEY；
  * 不打印明文 API Key。
  *
  * @param out 输出 Header value 缓冲区，不能为空。
@@ -99,19 +86,7 @@ esp_err_t llm_gateway_protocol_parse_chat_response(const char *json,
                                                    size_t out_size);
 
 /**
- * @brief 解析 HTTP ASR 响应文本。
- *
- * @param json 服务端 JSON 响应，不能为空。
- * @param out_text 输出 ASR 文本缓冲区，不能为空。
- * @param out_size out_text 字节数，必须大于 0。
- * @return 成功返回 ESP_OK；JSON 无效或未找到文本时返回错误码。
- */
-esp_err_t llm_gateway_protocol_parse_asr_http_response(const char *json,
-                                                       char *out_text,
-                                                       size_t out_size);
-
-/**
- * @brief 组装 ASR WebSocket session.start JSON。
+ * @brief 组装 ASR Realtime transcription_session.update JSON。
  *
  * 调用方法：返回的 out_json 由 llm_gateway_protocol_free() 释放。
  *
@@ -125,17 +100,54 @@ esp_err_t llm_gateway_protocol_build_asr_ws_start_event(const char *model,
                                                         size_t *out_len);
 
 /**
- * @brief 组装 ASR WebSocket session.finish JSON。
+ * @brief 组装 ASR Realtime input_audio_buffer.append JSON。
  *
- * 调用方法：返回的 out_json 由 llm_gateway_protocol_free() 释放。
+ * 调用方法：把一段 PCM bytes base64 后放入 audio 字段；返回的 out_json 由
+ * llm_gateway_protocol_free() 释放。
  *
- * @param model ASR 模型名，不能为空。
+ * @param audio PCM bytes 指针，不能为空。
+ * @param audio_len PCM bytes 数，必须大于 0。
  * @param out_json 输出 JSON 字符串指针，不能为空。
  * @param out_len 输出 JSON 字节数，不能为空。
  * @return 成功返回 ESP_OK；参数错误或内存不足时返回错误码。
  */
-esp_err_t llm_gateway_protocol_build_asr_ws_finish_event(const char *model,
-                                                         char **out_json,
+esp_err_t llm_gateway_protocol_build_asr_ws_audio_append_event(const uint8_t *audio,
+                                                               size_t audio_len,
+                                                               char **out_json,
+                                                               size_t *out_len);
+
+/**
+ * @brief 使用调用方复用缓冲区组装 ASR input_audio_buffer.append JSON。
+ *
+ * 调用方法：volc_gateway_asr 发送每个 100 ms PCM chunk 时调用，避免每包 malloc/free。
+ *
+ * @param audio PCM bytes 指针，不能为空。
+ * @param audio_len PCM bytes 数，必须大于 0。
+ * @param base64_buf base64 输出缓冲区，不能为空。
+ * @param base64_buf_size base64_buf 字节数，必须足够容纳编码结果。
+ * @param json_buf JSON 输出缓冲区，不能为空。
+ * @param json_buf_size json_buf 字节数，必须足够容纳 append JSON。
+ * @param out_len 输出 JSON 字节数，不能为空。
+ * @return 成功返回 ESP_OK；参数错误、缓冲不足或编码失败时返回错误码。
+ */
+esp_err_t llm_gateway_protocol_build_asr_ws_audio_append_event_inplace(const uint8_t *audio,
+                                                                       size_t audio_len,
+                                                                       char *base64_buf,
+                                                                       size_t base64_buf_size,
+                                                                       char *json_buf,
+                                                                       size_t json_buf_size,
+                                                                       size_t *out_len);
+
+/**
+ * @brief 组装 ASR Realtime input_audio_buffer.commit JSON。
+ *
+ * 调用方法：返回的 out_json 由 llm_gateway_protocol_free() 释放。
+ *
+ * @param out_json 输出 JSON 字符串指针，不能为空。
+ * @param out_len 输出 JSON 字节数，不能为空。
+ * @return 成功返回 ESP_OK；参数错误或内存不足时返回错误码。
+ */
+esp_err_t llm_gateway_protocol_build_asr_ws_finish_event(char **out_json,
                                                          size_t *out_len);
 
 /**

@@ -25,7 +25,7 @@ typedef struct {
  * 5. 如果要在运行时通过串口/网页新增 WiFi 并掉电保存，后续应改成 NVS 存储。
  */
 static const known_wifi_t WIFI_KNOWN_LIST[] = {
-    {"REPLACE_WITH_WIFI_SSID", "REPLACE_WITH_WIFI_PASSWORD"},
+    {"iPhoneWang", "Wlsz060501"},
     //{"EXAMPLE_WIFI_SSID_2", "EXAMPLE_WIFI_PASSWORD_2"}
 };
 

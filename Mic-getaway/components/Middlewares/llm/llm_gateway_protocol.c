@@ -6,6 +6,8 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "mbedtls/base64.h"
+#include "volc_gateway_auth.h"
 
 static const char *TAG = "llm_gateway_proto";
 
@@ -55,8 +57,13 @@ static bool llm_gateway_protocol_extract_text_candidates(const cJSON *root,
     }
 
     if (llm_gateway_protocol_copy_json_string(cJSON_GetObjectItemCaseSensitive(root, "text"), out_text, out_size) ||
+        llm_gateway_protocol_copy_json_string(cJSON_GetObjectItemCaseSensitive(root, "transcript"), out_text, out_size) ||
+        llm_gateway_protocol_copy_json_string(cJSON_GetObjectItemCaseSensitive(root, "delta"), out_text, out_size) ||
+        llm_gateway_protocol_copy_json_string(cJSON_GetObjectItemCaseSensitive(root, "result"), out_text, out_size) ||
         llm_gateway_protocol_copy_json_string(cJSON_GetObjectItemCaseSensitive(root, "output_text"), out_text, out_size) ||
         llm_gateway_protocol_copy_json_string(llm_gateway_protocol_get_path(root, "result", "text", NULL), out_text, out_size) ||
+        llm_gateway_protocol_copy_json_string(llm_gateway_protocol_get_path(root, "result", "transcript", NULL), out_text, out_size) ||
+        llm_gateway_protocol_copy_json_string(llm_gateway_protocol_get_path(root, "data", "transcript", NULL), out_text, out_size) ||
         llm_gateway_protocol_copy_json_string(llm_gateway_protocol_get_path(root, "data", "text", NULL), out_text, out_size)) {
         return true;
     }
@@ -64,73 +71,19 @@ static bool llm_gateway_protocol_extract_text_candidates(const cJSON *root,
     return false;
 }
 
-esp_err_t llm_gateway_protocol_build_url(const char *base_url,
-                                         const char *path,
-                                         char *out,
-                                         size_t out_size)
-{
-    if (base_url == NULL || base_url[0] == '\0' ||
-        path == NULL || path[0] == '\0' ||
-        out == NULL || out_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    bool base_slash = base_url[strlen(base_url) - 1] == '/';
-    bool path_slash = path[0] == '/';
-    int written = snprintf(out,
-                           out_size,
-                           "%s%s%s",
-                           base_url,
-                           (base_slash || path_slash) ? "" : "/",
-                           (base_slash && path_slash) ? path + 1 : path);
-    if (written < 0 || (size_t)written >= out_size) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    return ESP_OK;
-}
-
 esp_err_t llm_gateway_protocol_build_auth_header(char *out, size_t out_size)
 {
-    if (out == NULL || out_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    int written = snprintf(out,
-                           out_size,
-                           "%s%s",
-                           LLM_GATEWAY_AUTH_BEARER_PREFIX,
-                           LLM_GATEWAY_API_KEY);
-    if (written < 0 || (size_t)written >= out_size) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    return ESP_OK;
+    return volc_gateway_auth_build_authorization(out, out_size);
 }
 
 void llm_gateway_protocol_make_key_summary(char *out, size_t out_size)
 {
-    if (out == NULL || out_size == 0) {
-        return;
-    }
-
-    size_t key_len = strlen(LLM_GATEWAY_API_KEY);
-    if (key_len < 7) {
-        snprintf(out, out_size, "len=%u, masked=***", (unsigned int)key_len);
-        return;
-    }
-
-    snprintf(out,
-             out_size,
-             "len=%u, masked=%.3s***%s",
-             (unsigned int)key_len,
-             LLM_GATEWAY_API_KEY,
-             LLM_GATEWAY_API_KEY + key_len - 3);
+    volc_gateway_auth_make_key_summary(out, out_size);
 }
 
 bool llm_gateway_protocol_config_has_placeholders(void)
 {
-    return strstr(LLM_GATEWAY_HTTP_BASE_URL, LLM_GATEWAY_PLACEHOLDER_MARKER) != NULL ||
-           strstr(LLM_GATEWAY_WS_BASE_URL, LLM_GATEWAY_PLACEHOLDER_MARKER) != NULL ||
-           strstr(LLM_GATEWAY_API_KEY, LLM_GATEWAY_PLACEHOLDER_MARKER) != NULL;
+    return volc_gateway_auth_has_placeholder();
 }
 
 esp_err_t llm_gateway_protocol_build_chat_request(const char *model,
@@ -171,6 +124,7 @@ esp_err_t llm_gateway_protocol_build_chat_request(const char *model,
     cJSON_AddItemToArray(messages, system);
     cJSON_AddItemToArray(messages, user);
     cJSON_AddItemToObject(root, "messages", messages);
+    cJSON_AddBoolToObject(root, "stream", false);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -203,13 +157,6 @@ esp_err_t llm_gateway_protocol_parse_chat_response(const char *json,
     return found ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
-esp_err_t llm_gateway_protocol_parse_asr_http_response(const char *json,
-                                                       char *out_text,
-                                                       size_t out_size)
-{
-    return llm_gateway_protocol_parse_chat_response(json, out_text, out_size);
-}
-
 esp_err_t llm_gateway_protocol_build_asr_ws_start_event(const char *model,
                                                         char **out_json,
                                                         size_t *out_len)
@@ -222,20 +169,24 @@ esp_err_t llm_gateway_protocol_build_asr_ws_start_event(const char *model,
     *out_len = 0;
 
     cJSON *root = cJSON_CreateObject();
-    cJSON *audio = cJSON_CreateObject();
-    if (root == NULL || audio == NULL) {
+    cJSON *session = cJSON_CreateObject();
+    cJSON *transcription = cJSON_CreateObject();
+    if (root == NULL || session == NULL || transcription == NULL) {
         cJSON_Delete(root);
-        cJSON_Delete(audio);
+        cJSON_Delete(session);
+        cJSON_Delete(transcription);
         return ESP_ERR_NO_MEM;
     }
 
-    cJSON_AddStringToObject(root, "type", "session.start");
-    cJSON_AddStringToObject(root, "model", model);
-    cJSON_AddStringToObject(audio, "format", LLM_GATEWAY_AUDIO_FORMAT);
-    cJSON_AddNumberToObject(audio, "sample_rate", LLM_GATEWAY_AUDIO_SAMPLE_RATE);
-    cJSON_AddNumberToObject(audio, "bits", LLM_GATEWAY_AUDIO_BITS);
-    cJSON_AddNumberToObject(audio, "channels", LLM_GATEWAY_AUDIO_CHANNELS);
-    cJSON_AddItemToObject(root, "audio", audio);
+    cJSON_AddStringToObject(root, "type", "transcription_session.update");
+    cJSON_AddItemToObject(root, "session", session);
+    cJSON_AddStringToObject(session, "input_audio_format", LLM_GATEWAY_AUDIO_FORMAT);
+    cJSON_AddStringToObject(session, "input_audio_codec", LLM_GATEWAY_AUDIO_CODEC);
+    cJSON_AddNumberToObject(session, "input_audio_sample_rate", LLM_GATEWAY_AUDIO_SAMPLE_RATE);
+    cJSON_AddNumberToObject(session, "input_audio_bits", LLM_GATEWAY_AUDIO_BITS);
+    cJSON_AddNumberToObject(session, "input_audio_channel", LLM_GATEWAY_AUDIO_CHANNELS);
+    cJSON_AddStringToObject(transcription, "model", model);
+    cJSON_AddItemToObject(session, "input_audio_transcription", transcription);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -248,12 +199,109 @@ esp_err_t llm_gateway_protocol_build_asr_ws_start_event(const char *model,
     return ESP_OK;
 }
 
-esp_err_t llm_gateway_protocol_build_asr_ws_finish_event(const char *model,
-                                                         char **out_json,
+esp_err_t llm_gateway_protocol_build_asr_ws_audio_append_event(const uint8_t *audio,
+                                                               size_t audio_len,
+                                                               char **out_json,
+                                                               size_t *out_len)
+{
+    if (audio == NULL || audio_len == 0 ||
+        out_json == NULL || out_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_json = NULL;
+    *out_len = 0;
+
+    size_t encoded_size = 0;
+    int encode_ret = mbedtls_base64_encode(NULL, 0, &encoded_size, audio, audio_len);
+    if (encode_ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL || encoded_size == 0) {
+        return ESP_FAIL;
+    }
+
+    uint8_t *encoded = (uint8_t *)malloc(encoded_size + 1U);
+    if (encoded == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    size_t encoded_len = 0;
+    encode_ret = mbedtls_base64_encode(encoded, encoded_size, &encoded_len, audio, audio_len);
+    if (encode_ret != 0) {
+        free(encoded);
+        return ESP_FAIL;
+    }
+    encoded[encoded_len] = '\0';
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        free(encoded);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "type", "input_audio_buffer.append");
+    cJSON_AddStringToObject(root, "audio", (const char *)encoded);
+    free(encoded);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    *out_json = json;
+    *out_len = strlen(json);
+    return ESP_OK;
+}
+
+esp_err_t llm_gateway_protocol_build_asr_ws_audio_append_event_inplace(const uint8_t *audio,
+                                                                       size_t audio_len,
+                                                                       char *base64_buf,
+                                                                       size_t base64_buf_size,
+                                                                       char *json_buf,
+                                                                       size_t json_buf_size,
+                                                                       size_t *out_len)
+{
+    if (audio == NULL || audio_len == 0 ||
+        base64_buf == NULL || base64_buf_size == 0 ||
+        json_buf == NULL || json_buf_size == 0 ||
+        out_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_len = 0;
+
+    size_t encoded_size = 0;
+    int encode_ret = mbedtls_base64_encode(NULL, 0, &encoded_size, audio, audio_len);
+    if (encode_ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL || encoded_size == 0) {
+        return ESP_FAIL;
+    }
+    if (encoded_size + 1U > base64_buf_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    size_t encoded_len = 0;
+    encode_ret = mbedtls_base64_encode((uint8_t *)base64_buf,
+                                       base64_buf_size,
+                                       &encoded_len,
+                                       audio,
+                                       audio_len);
+    if (encode_ret != 0 || encoded_len >= base64_buf_size) {
+        return ESP_FAIL;
+    }
+    base64_buf[encoded_len] = '\0';
+
+    int written = snprintf(json_buf,
+                           json_buf_size,
+                           "{\"type\":\"input_audio_buffer.append\",\"audio\":\"%s\"}",
+                           base64_buf);
+    if (written < 0 || (size_t)written >= json_buf_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    *out_len = (size_t)written;
+    return ESP_OK;
+}
+
+esp_err_t llm_gateway_protocol_build_asr_ws_finish_event(char **out_json,
                                                          size_t *out_len)
 {
-    if (model == NULL || model[0] == '\0' ||
-        out_json == NULL || out_len == NULL) {
+    if (out_json == NULL || out_len == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     *out_json = NULL;
@@ -265,7 +313,6 @@ esp_err_t llm_gateway_protocol_build_asr_ws_finish_event(const char *model,
     }
 
     cJSON_AddStringToObject(root, "type", "input_audio_buffer.commit");
-    cJSON_AddStringToObject(root, "model", model);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -297,6 +344,9 @@ esp_err_t llm_gateway_protocol_parse_asr_ws_event(const char *payload,
     const char *type_text = cJSON_IsString(type) ? type->valuestring : NULL;
     const char *event_text = cJSON_IsString(event) ? event->valuestring : NULL;
     const char *name = type_text != NULL ? type_text : event_text;
+    if (name != NULL && name[0] != '\0') {
+        strlcpy(out_event->type, name, sizeof(out_event->type));
+    }
 
     const cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "code");
     const cJSON *message = cJSON_GetObjectItemCaseSensitive(root, "message");
@@ -316,15 +366,31 @@ esp_err_t llm_gateway_protocol_parse_asr_ws_event(const char *payload,
         out_event->audio_len = (size_t)audio_len->valueint;
     }
 
-    (void)llm_gateway_protocol_extract_text_candidates(root,
-                                                       out_event->text,
-                                                       sizeof(out_event->text));
+    if (!llm_gateway_protocol_extract_text_candidates(root,
+                                                      out_event->text,
+                                                      sizeof(out_event->text))) {
+        (void)llm_gateway_protocol_copy_json_string(llm_gateway_protocol_get_path(root, "transcript", "text", NULL),
+                                                    out_event->text,
+                                                    sizeof(out_event->text));
+        (void)llm_gateway_protocol_copy_json_string(llm_gateway_protocol_get_path(root, "item", "transcript", NULL),
+                                                    out_event->text,
+                                                    sizeof(out_event->text));
+        (void)llm_gateway_protocol_copy_json_string(llm_gateway_protocol_get_path(root, "item", "content", NULL),
+                                                    out_event->text,
+                                                    sizeof(out_event->text));
+    }
+
+    if (APP_DEBUG_LLM_GATEWAY_PROTO && name != NULL) {
+        ESP_LOGI(TAG, "ASR WS event type=%s text_len=%u", name, (unsigned int)strlen(out_event->text));
+    }
 
     if (name != NULL) {
         out_event->is_final = strstr(name, "final") != NULL ||
                               strstr(name, "completed") != NULL ||
+                              strstr(name, "conversation.item.input_audio_transcription.completed") != NULL ||
                               strstr(name, "transcription.done") != NULL;
         out_event->is_partial = strstr(name, "partial") != NULL ||
+                                strstr(name, "conversation.item.input_audio_transcription.result") != NULL ||
                                 strstr(name, "delta") != NULL ||
                                 strstr(name, "transcription.delta") != NULL;
         if (strstr(name, "error") != NULL) {

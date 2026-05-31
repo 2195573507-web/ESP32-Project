@@ -1,17 +1,18 @@
 set(srcs
             wifi/wifi_manager.c
             llm/llm_client.c
+            llm/ai_bridge_common.c
+            llm/volc_gateway_auth.c
             llm/llm_gateway_http.c
             llm/llm_gateway_ws.c
             llm/llm_gateway_protocol.c
-            llm/llm_router.c
-            llm/llm_wav.c
             mic/mic_adc_test.c
             mic/mic_adc_pcm.c
             mic/mic_record_buffer.c
             mic/mic_serial_output.c
             mic/mic_vad.c
             mic/mic_llm_bridge.c
+            screen/ai_screen_bridge.c
             speaker/speaker_llm_bridge.c
             sensors/bme690_llm_bridge.c
             sensors/csi_llm_bridge.c
@@ -21,6 +22,7 @@ set(include_dirs
             wifi
             llm
             mic
+            screen
             speaker
             sensors
             system)

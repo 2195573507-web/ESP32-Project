@@ -9,7 +9,7 @@
 
 /**
  * @file llm_gateway_ws.h
- * @brief 豆包边缘网关 ASR WebSocket streaming 封装。
+ * @brief 火山引擎边缘网关 ASR WebSocket streaming 封装。
  *
  * 调用方法：只允许 llm_client 调用本文件接口。上层 bridge 不直接依赖官方
  * esp_websocket_client、WebSocket 事件或 ASR streaming JSON。
@@ -20,14 +20,13 @@ typedef enum {
     LLM_GATEWAY_WS_EVENT_DISCONNECTED,   // WebSocket 已断开。
     LLM_GATEWAY_WS_EVENT_ASR_PARTIAL,    // ASR partial 文本。
     LLM_GATEWAY_WS_EVENT_ASR_FINAL,      // ASR final 文本。
-    LLM_GATEWAY_WS_EVENT_TTS_AUDIO,      // TTS 音频占位，当前不播放。
     LLM_GATEWAY_WS_EVENT_ERROR,          // WebSocket 或服务端错误。
 } llm_gateway_ws_event_type_t;
 
 typedef struct {
     llm_gateway_ws_event_type_t type; // 事件类型。
     const char *text;                 // ASR 文本，可为空。
-    size_t audio_len;                 // TTS 音频字节数，当前仅记录。
+    size_t audio_len;                 // 预留音频字节数，当前 ASR 主链路不用。
     int code;                         // 错误码或服务端状态码。
     const char *message;              // 错误/状态说明，可为空。
 } llm_gateway_ws_event_t;
@@ -44,17 +43,18 @@ typedef struct {
  * @brief 启动 ASR WebSocket streaming 会话。
  *
  * 调用方法：llm_client_start_voice_session() 内部调用。函数会拼接 WS URL、
- * 设置 Authorization Header，并发送 session.start JSON。
+ * 使用固定网关 Realtime URI，设置 Authorization Header，并发送 transcription_session.update JSON。
  *
  * @param config WebSocket 配置，不能为空；asr_model 不能为空。
- * @return 成功返回 ESP_OK；建连、鉴权或 session.start 失败时返回错误码。
+ * @return 成功返回 ESP_OK；建连、鉴权或 session update 失败时返回错误码。
  */
 esp_err_t llm_gateway_ws_start(const llm_gateway_ws_config_t *config);
 
 /**
  * @brief 向当前 ASR WebSocket 会话发送 PCM16 音频。
  *
- * 调用方法：Mic 采集任务经 mic_llm_bridge/llm_client 转发到这里。
+ * 调用方法：Mic 采集任务经 mic_llm_bridge/llm_client 转发到这里；内部会按
+ * Realtime API 要求封装成 input_audio_buffer.append JSON。
  *
  * @param pcm PCM16 样本指针，不能为空。
  * @param samples PCM 样本数，必须大于 0。
