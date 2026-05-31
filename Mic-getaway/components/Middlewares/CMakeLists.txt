@@ -14,6 +14,8 @@ set(srcs
             mic/mic_vad.c
             mic/mic_llm_bridge.c
             screen/ai_screen_bridge.c
+            speaker/speaker_player.c
+            speaker/speaker_resample.c
             speaker/speaker_llm_bridge.c
             sensors/bme690_llm_bridge.c
             sensors/csi_llm_bridge.c
@@ -40,9 +42,12 @@ set(requires
             app_config
             json
             esp_rom
+            esp_ringbuf
             esp_timer
             espressif__esp_websocket_client
             freertos
+            heap
+            IIS
             log)
 
 idf_component_register(SRCS ${srcs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})

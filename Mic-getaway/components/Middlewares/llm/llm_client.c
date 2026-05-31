@@ -1,6 +1,7 @@
 #include "llm_client.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -33,6 +34,10 @@ typedef struct {
     llm_client_state_t state;
     llm_client_event_cb_t event_cb;
     void *user_ctx;
+    llm_client_tts_audio_sink_t tts_audio_sink;
+    void *tts_audio_sink_ctx;
+    llm_client_tts_done_sink_t tts_done_sink;
+    void *tts_done_sink_ctx;
     const char *system_prompt;
     char asr_final_text[LLM_GATEWAY_ASR_TEXT_MAX_BYTES];
     char asr_last_partial_text[LLM_GATEWAY_ASR_TEXT_MAX_BYTES];
@@ -563,7 +568,10 @@ static void llm_client_tts_ws_event_cb(const llm_gateway_tts_ws_event_t *event, 
     case LLM_GATEWAY_TTS_WS_EVENT_AUDIO_DELTA:
         if (event->audio != NULL && event->audio_len > 0) {
             if (APP_DEBUG_LLM_GATEWAY_AUDIO) {
-                ESP_LOGI(TAG, "TTS AUDIO chunk bytes=%u", (unsigned int)event->audio_len);
+                ESP_LOGI(TAG,
+                         "TTS AUDIO chunk bytes=%u owned=%d",
+                         (unsigned int)event->audio_len,
+                         event->audio_owned ? 1 : 0);
             }
             llm_client_emit(LLM_CLIENT_EVENT_TTS_AUDIO,
                             NULL,
@@ -571,12 +579,36 @@ static void llm_client_tts_ws_event_cb(const llm_gateway_tts_ws_event_t *event, 
                             event->audio_len,
                             0,
                             NULL);
+
+            bool ownership_transferred = false;
+            if (s_client.tts_audio_sink != NULL) {
+                esp_err_t sink_ret = s_client.tts_audio_sink(event->audio,
+                                                             event->audio_len,
+                                                             LLM_TTS_SAMPLE_RATE,
+                                                             event->audio_owned,
+                                                             s_client.tts_audio_sink_ctx);
+                if (sink_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "TTS audio sink failed: %s", esp_err_to_name(sink_ret));
+                } else if (event->audio_owned) {
+                    ownership_transferred = true;
+                }
+            }
+            if (event->audio_owned && !ownership_transferred) {
+                free(event->audio);
+            }
         }
         break;
     case LLM_GATEWAY_TTS_WS_EVENT_AUDIO_DONE:
         if (APP_DEBUG_LLM_CLIENT) {
             ESP_LOGI(TAG, "TTS audio done");
         }
+        if (s_client.tts_done_sink != NULL) {
+            esp_err_t done_ret = s_client.tts_done_sink(s_client.tts_done_sink_ctx);
+            if (done_ret != ESP_OK) {
+                ESP_LOGW(TAG, "TTS done sink failed: %s", esp_err_to_name(done_ret));
+            }
+        }
+        llm_client_emit(LLM_CLIENT_EVENT_TTS_DONE, NULL, NULL, 0, 0, NULL);
         break;
     case LLM_GATEWAY_TTS_WS_EVENT_DISCONNECTED:
         if (APP_DEBUG_LLM_CLIENT) {
@@ -967,4 +999,16 @@ esp_err_t llm_client_tts_text(const char *text)
 bool llm_client_is_tts_enabled(void)
 {
     return LLM_GATEWAY_ENABLE_TTS != 0;
+}
+
+void llm_client_set_tts_audio_sink(llm_client_tts_audio_sink_t sink, void *user_ctx)
+{
+    s_client.tts_audio_sink = sink;
+    s_client.tts_audio_sink_ctx = user_ctx;
+}
+
+void llm_client_set_tts_done_sink(llm_client_tts_done_sink_t sink, void *user_ctx)
+{
+    s_client.tts_done_sink = sink;
+    s_client.tts_done_sink_ctx = user_ctx;
 }

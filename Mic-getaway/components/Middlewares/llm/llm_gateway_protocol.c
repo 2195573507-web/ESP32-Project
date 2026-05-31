@@ -6,6 +6,7 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "mbedtls/base64.h"
 #include "volc_gateway_auth.h"
 
@@ -690,9 +691,9 @@ esp_err_t llm_gateway_protocol_build_tts_ws_session_update(const char *model,
 
     cJSON_AddStringToObject(root, "type", "tts_session.update");
     cJSON_AddItemToObject(root, "session", session);
-    cJSON_AddStringToObject(session, "voice", VOLC_GATEWAY_TTS_VOICE);
-    cJSON_AddStringToObject(session, "output_audio_format", VOLC_GATEWAY_TTS_OUTPUT_FORMAT);
-    cJSON_AddNumberToObject(session, "output_audio_sample_rate", VOLC_GATEWAY_TTS_OUTPUT_SAMPLE_RATE);
+    cJSON_AddStringToObject(session, "voice", LLM_TTS_VOICE);
+    cJSON_AddStringToObject(session, "output_audio_format", LLM_TTS_OUTPUT_FORMAT);
+    cJSON_AddNumberToObject(session, "output_audio_sample_rate", LLM_TTS_SAMPLE_RATE);
     cJSON_AddStringToObject(text_to_speech, "model", model);
     cJSON_AddItemToObject(session, "text_to_speech", text_to_speech);
 
@@ -761,6 +762,210 @@ esp_err_t llm_gateway_protocol_build_tts_ws_text_done(char **out_json,
 
     *out_json = json;
     *out_len = strlen(json);
+    return ESP_OK;
+}
+
+static bool llm_gateway_protocol_json_ws(char ch)
+{
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+}
+
+static bool llm_gateway_protocol_json_object_wrapped(const char *payload, size_t payload_len)
+{
+    if (payload == NULL || payload_len == 0) {
+        return false;
+    }
+
+    size_t first = 0;
+    while (first < payload_len && llm_gateway_protocol_json_ws(payload[first])) {
+        first++;
+    }
+    if (first >= payload_len || payload[first] != '{') {
+        return false;
+    }
+
+    size_t last = payload_len;
+    while (last > first && llm_gateway_protocol_json_ws(payload[last - 1U])) {
+        last--;
+    }
+    return last > first && payload[last - 1U] == '}';
+}
+
+static const char *llm_gateway_protocol_find_json_string_end(const char *start,
+                                                             const char *end)
+{
+    bool escaped = false;
+    for (const char *cursor = start; cursor < end; cursor++) {
+        char ch = *cursor;
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') {
+            return cursor;
+        }
+    }
+    return NULL;
+}
+
+static bool llm_gateway_protocol_json_string_equals(const char *start,
+                                                    const char *end,
+                                                    const char *expected)
+{
+    if (start == NULL || end == NULL || expected == NULL || end < start) {
+        return false;
+    }
+
+    size_t expected_len = strlen(expected);
+    if ((size_t)(end - start) != expected_len) {
+        return false;
+    }
+    return memcmp(start, expected, expected_len) == 0;
+}
+
+static bool llm_gateway_protocol_find_json_string_value(const char *payload,
+                                                        size_t payload_len,
+                                                        const char *key,
+                                                        const char **out_value,
+                                                        size_t *out_value_len)
+{
+    if (payload == NULL || key == NULL || out_value == NULL || out_value_len == NULL) {
+        return false;
+    }
+
+    const char *cursor = payload;
+    const char *end = payload + payload_len;
+    while (cursor < end) {
+        if (*cursor != '"') {
+            cursor++;
+            continue;
+        }
+
+        const char *key_start = cursor + 1;
+        const char *key_end = llm_gateway_protocol_find_json_string_end(key_start, end);
+        if (key_end == NULL) {
+            return false;
+        }
+        cursor = key_end + 1;
+        if (!llm_gateway_protocol_json_string_equals(key_start, key_end, key)) {
+            continue;
+        }
+
+        while (cursor < end && llm_gateway_protocol_json_ws(*cursor)) {
+            cursor++;
+        }
+        if (cursor >= end || *cursor != ':') {
+            continue;
+        }
+        cursor++;
+        while (cursor < end && llm_gateway_protocol_json_ws(*cursor)) {
+            cursor++;
+        }
+        if (cursor >= end || *cursor != '"') {
+            return false;
+        }
+
+        const char *value_start = cursor + 1;
+        const char *value_end = llm_gateway_protocol_find_json_string_end(value_start, end);
+        if (value_end == NULL) {
+            return false;
+        }
+
+        *out_value = value_start;
+        *out_value_len = (size_t)(value_end - value_start);
+        return true;
+    }
+
+    return false;
+}
+
+static esp_err_t llm_gateway_protocol_try_parse_tts_audio_delta_fast(const char *payload,
+                                                                     size_t payload_len,
+                                                                     llm_gateway_tts_event_t *out_event,
+                                                                     uint8_t **out_audio,
+                                                                     size_t *out_audio_len,
+                                                                     bool *handled)
+{
+    *handled = false;
+
+    const char *type_start = NULL;
+    size_t type_len = 0;
+    if (!llm_gateway_protocol_find_json_string_value(payload,
+                                                     payload_len,
+                                                     "type",
+                                                     &type_start,
+                                                     &type_len)) {
+        return ESP_OK;
+    }
+    if (!llm_gateway_protocol_json_string_equals(type_start,
+                                                 type_start + type_len,
+                                                 "response.audio.delta")) {
+        return ESP_OK;
+    }
+
+    *handled = true;
+    strlcpy(out_event->type, "response.audio.delta", sizeof(out_event->type));
+    out_event->is_audio_delta = true;
+
+    if (!llm_gateway_protocol_json_object_wrapped(payload, payload_len)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    const char *delta_start = NULL;
+    size_t delta_len = 0;
+    if (!llm_gateway_protocol_find_json_string_value(payload,
+                                                     payload_len,
+                                                     "delta",
+                                                     &delta_start,
+                                                     &delta_len) ||
+        delta_len == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    out_event->audio_base64_len = delta_len;
+    size_t decoded_need = 0;
+    int decode_ret = mbedtls_base64_decode(NULL,
+                                           0,
+                                           &decoded_need,
+                                           (const unsigned char *)delta_start,
+                                           delta_len);
+    if (decode_ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL && decode_ret != 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (decoded_need == 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (decoded_need > LLM_GATEWAY_TTS_AUDIO_CHUNK_MAX_BYTES) {
+        out_event->audio_len = decoded_need;
+        out_event->is_audio_dropped = true;
+        return ESP_OK;
+    }
+
+    uint8_t *decoded = (uint8_t *)malloc(decoded_need);
+    if (decoded == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t decoded_len = 0;
+    int64_t decode_start_us = esp_timer_get_time();
+    decode_ret = mbedtls_base64_decode(decoded,
+                                       decoded_need,
+                                       &decoded_len,
+                                       (const unsigned char *)delta_start,
+                                       delta_len);
+    out_event->audio_decode_us = esp_timer_get_time() - decode_start_us;
+    if (decode_ret != 0 || decoded_len == 0) {
+        free(decoded);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    out_event->audio_len = decoded_len;
+    *out_audio = decoded;
+    *out_audio_len = decoded_len;
     return ESP_OK;
 }
 
@@ -841,6 +1046,7 @@ esp_err_t llm_gateway_protocol_parse_tts_ws_event(const char *payload,
 
         const unsigned char *encoded = (const unsigned char *)delta->valuestring;
         size_t encoded_len = strlen(delta->valuestring);
+        out_event->audio_base64_len = encoded_len;
         size_t decoded_need = 0;
         int decode_ret = mbedtls_base64_decode(NULL, 0, &decoded_need, encoded, encoded_len);
         if (decode_ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL && decode_ret != 0) {
@@ -853,11 +1059,13 @@ esp_err_t llm_gateway_protocol_parse_tts_ws_event(const char *payload,
         }
 
         size_t decoded_len = 0;
+        int64_t decode_start_us = esp_timer_get_time();
         decode_ret = mbedtls_base64_decode(audio_buf,
                                            audio_buf_size,
                                            &decoded_len,
                                            encoded,
                                            encoded_len);
+        out_event->audio_decode_us = esp_timer_get_time() - decode_start_us;
         if (decode_ret != 0) {
             cJSON_Delete(root);
             return ESP_ERR_INVALID_RESPONSE;
@@ -872,6 +1080,152 @@ esp_err_t llm_gateway_protocol_parse_tts_ws_event(const char *payload,
                  (unsigned int)out_event->audio_len,
                  out_event->is_audio_done ? 1 : 0,
                  out_event->is_error ? 1 : 0);
+    }
+
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+esp_err_t llm_gateway_protocol_parse_tts_ws_event_owned_audio(const char *payload,
+                                                              size_t payload_len,
+                                                              llm_gateway_tts_event_t *out_event,
+                                                              uint8_t **out_audio,
+                                                              size_t *out_audio_len)
+{
+    if (payload == NULL || payload_len == 0 ||
+        out_event == NULL || out_audio == NULL || out_audio_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out_event, 0, sizeof(*out_event));
+    *out_audio = NULL;
+    *out_audio_len = 0;
+
+    bool handled_fast = false;
+    esp_err_t fast_ret = llm_gateway_protocol_try_parse_tts_audio_delta_fast(payload,
+                                                                            payload_len,
+                                                                            out_event,
+                                                                            out_audio,
+                                                                            out_audio_len,
+                                                                            &handled_fast);
+    if (handled_fast) {
+        return fast_ret;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(payload, payload_len);
+    if (root == NULL) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    const cJSON *event = cJSON_GetObjectItemCaseSensitive(root, "event");
+    const char *type_text = cJSON_IsString(type) ? type->valuestring : NULL;
+    const char *event_text = cJSON_IsString(event) ? event->valuestring : NULL;
+    const char *name = type_text != NULL ? type_text : event_text;
+    if (name != NULL && name[0] != '\0') {
+        strlcpy(out_event->type, name, sizeof(out_event->type));
+    }
+
+    const cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "code");
+    const cJSON *message = cJSON_GetObjectItemCaseSensitive(root, "message");
+    const cJSON *error = cJSON_GetObjectItemCaseSensitive(root, "error");
+    if (cJSON_IsNumber(code)) {
+        out_event->code = code->valueint;
+    }
+    if (cJSON_IsObject(error)) {
+        const cJSON *error_code = cJSON_GetObjectItemCaseSensitive(error, "code");
+        const cJSON *error_message = cJSON_GetObjectItemCaseSensitive(error, "message");
+        if (cJSON_IsNumber(error_code)) {
+            out_event->code = error_code->valueint;
+        }
+        (void)llm_gateway_protocol_copy_json_string(error_message,
+                                                    out_event->message,
+                                                    sizeof(out_event->message));
+    } else {
+        (void)llm_gateway_protocol_copy_json_string(error,
+                                                    out_event->message,
+                                                    sizeof(out_event->message));
+    }
+    if (out_event->message[0] == '\0') {
+        (void)llm_gateway_protocol_copy_json_string(message,
+                                                    out_event->message,
+                                                    sizeof(out_event->message));
+    }
+
+    if (name != NULL) {
+        out_event->is_session_updated = strcmp(name, "tts_session.updated") == 0;
+        out_event->is_audio_delta = strcmp(name, "response.audio.delta") == 0 ||
+                                    strstr(name, "audio.delta") != NULL;
+        out_event->is_audio_done = strcmp(name, "response.audio.done") == 0 ||
+                                   strstr(name, "audio.done") != NULL ||
+                                   strstr(name, "completed") != NULL;
+        if (strstr(name, "error") != NULL) {
+            out_event->is_error = true;
+        }
+    }
+    if (out_event->code != 0 || out_event->message[0] != '\0') {
+        out_event->is_error = out_event->is_error || (name != NULL && strstr(name, "error") != NULL);
+    }
+
+    if (out_event->is_audio_delta) {
+        const cJSON *delta = cJSON_GetObjectItemCaseSensitive(root, "delta");
+        if (!cJSON_IsString(delta) || delta->valuestring == NULL || delta->valuestring[0] == '\0') {
+            cJSON_Delete(root);
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        const unsigned char *encoded = (const unsigned char *)delta->valuestring;
+        size_t encoded_len = strlen(delta->valuestring);
+        size_t decoded_need = 0;
+        out_event->audio_base64_len = encoded_len;
+        int decode_ret = mbedtls_base64_decode(NULL, 0, &decoded_need, encoded, encoded_len);
+        if (decode_ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL && decode_ret != 0) {
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        if (decoded_need == 0) {
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (decoded_need > LLM_GATEWAY_TTS_AUDIO_CHUNK_MAX_BYTES) {
+            out_event->audio_len = decoded_need;
+            out_event->is_audio_dropped = true;
+            cJSON_Delete(root);
+            return ESP_OK;
+        }
+
+        uint8_t *decoded = (uint8_t *)malloc(decoded_need);
+        if (decoded == NULL) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
+
+        size_t decoded_len = 0;
+        int64_t decode_start_us = esp_timer_get_time();
+        decode_ret = mbedtls_base64_decode(decoded,
+                                           decoded_need,
+                                           &decoded_len,
+                                           encoded,
+                                           encoded_len);
+        out_event->audio_decode_us = esp_timer_get_time() - decode_start_us;
+        if (decode_ret != 0 || decoded_len == 0) {
+            free(decoded);
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        out_event->audio_len = decoded_len;
+        *out_audio = decoded;
+        *out_audio_len = decoded_len;
+    }
+
+    if (APP_DEBUG_LLM_GATEWAY_PROTO && name != NULL) {
+        ESP_LOGI(TAG,
+                 "TTS WS event type=%s audio_len=%u done=%d error=%d owned_audio=%d",
+                 name,
+                 (unsigned int)out_event->audio_len,
+                 out_event->is_audio_done ? 1 : 0,
+                 out_event->is_error ? 1 : 0,
+                 *out_audio != NULL ? 1 : 0);
     }
 
     cJSON_Delete(root);

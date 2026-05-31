@@ -31,6 +31,8 @@ static const char *mic_llm_bridge_event_name(llm_client_event_type_t type)
         return "command_result";
     case LLM_CLIENT_EVENT_TTS_AUDIO:
         return "tts_audio";
+    case LLM_CLIENT_EVENT_TTS_DONE:
+        return "tts_done";
     case LLM_CLIENT_EVENT_ERROR:
         return "error";
     default:

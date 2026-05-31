@@ -32,11 +32,14 @@ typedef struct {
     bool is_session_updated;                      // true 表示 TTS session 配置已生效。
     bool is_audio_delta;                          // true 表示本事件携带一段 TTS 音频。
     bool is_audio_done;                           // true 表示本轮 TTS 音频输出完成。
+    bool is_audio_dropped;                        // true 表示音频事件已识别但因本地上限被丢弃。
     bool is_error;                                // true 表示服务端错误事件。
     char type[96];                                // 服务端事件 type/event 名。
     char message[160];                            // 服务端错误/状态说明。
     int code;                                     // 服务端状态码或本地错误码。
     size_t audio_len;                             // 解码后的音频字节数。
+    size_t audio_base64_len;                      // response.audio.delta 的 base64 字符串字节数。
+    int64_t audio_decode_us;                      // base64 decode 耗时，非音频事件为 0。
 } llm_gateway_tts_event_t;
 
 /**
@@ -224,6 +227,25 @@ esp_err_t llm_gateway_protocol_parse_tts_ws_event(const char *payload,
                                                   uint8_t *audio_buf,
                                                   size_t audio_buf_size,
                                                   llm_gateway_tts_event_t *out_event);
+
+/**
+ * @brief 解析 TTS WebSocket 服务端事件，并把 response.audio.delta 解码到新分配 PCM chunk。
+ *
+ * 调用方法：llm_gateway_tts_ws 收到完整 JSON payload 后调用。若返回音频，
+ * *out_audio 的 ownership 转移给调用方；调用方入队失败时必须 free。
+ *
+ * @param payload WebSocket payload，不能为空。
+ * @param payload_len payload 字节数，必须大于 0。
+ * @param out_event 输出解析结果，不能为空。
+ * @param out_audio 输出 PCM 指针；仅 AUDIO_DELTA 且 audio_len > 0 时非空。
+ * @param out_audio_len 输出 PCM 字节数。
+ * @return 成功返回 ESP_OK；payload 不是可识别 JSON、音频过大或内存不足时返回错误码。
+ */
+esp_err_t llm_gateway_protocol_parse_tts_ws_event_owned_audio(const char *payload,
+                                                              size_t payload_len,
+                                                              llm_gateway_tts_event_t *out_event,
+                                                              uint8_t **out_audio,
+                                                              size_t *out_audio_len);
 
 /**
  * @brief 释放本协议模块分配的 JSON 字符串。

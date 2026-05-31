@@ -10,13 +10,14 @@
  * @brief speaker/TTS 到统一 llm_client 的桥接层。
  *
  * 调用方法：speaker 模块只调用本文件，不直接依赖 llm_client 或网关 TTS path。
- * 当前阶段已可发起 TTS 合成，但尚未接入实际扬声器播放底层。
+ * 当前阶段已可发起 TTS 合成，并把 TTS PCM 音频交给 speaker_player 播放。
  */
 
 /**
  * @brief 初始化 speaker LLM bridge。
  *
- * 调用方法：系统初始化时可调用一次；当前记录 TTS 是否启用。
+ * 调用方法：系统初始化时可调用一次；内部初始化 speaker_player 并注册
+ * llm_client TTS 音频接收回调。不会自动启动 Mic 或测试 PCM。
  *
  * @return 成功返回 ESP_OK。
  */
@@ -39,6 +40,6 @@ esp_err_t speaker_llm_bridge_speak_text(const char *text);
  */
 bool speaker_llm_bridge_is_enabled(void);
 
-/* 当前阶段保留兼容入口，实际合成由 llm_client_tts_text() 执行。 */
+/* 实际 TTS 合成仍由 llm_client_tts_text() 执行，speaker bridge 只负责播放音频。 */
 
 #endif // SPEAKER_LLM_BRIDGE_H

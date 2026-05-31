@@ -34,6 +34,7 @@ typedef enum {
     LLM_CLIENT_EVENT_LLM_FINAL_TEXT,   // LLM final 文本。
     LLM_CLIENT_EVENT_COMMAND_RESULT,   // router 已处理 command/speech 结果。
     LLM_CLIENT_EVENT_TTS_AUDIO,        // TTS 音频 chunk，可交给 speaker 底层播放。
+    LLM_CLIENT_EVENT_TTS_DONE,         // TTS 本轮音频输出完成。
     LLM_CLIENT_EVENT_ERROR,            // 网关、解析或 router 错误。
 } llm_client_event_type_t;
 
@@ -53,6 +54,12 @@ typedef struct {
 } llm_client_event_t;
 
 typedef void (*llm_client_event_cb_t)(const llm_client_event_t *event, void *user_ctx);
+typedef esp_err_t (*llm_client_tts_audio_sink_t)(uint8_t *audio,
+                                                 size_t audio_len,
+                                                 int sample_rate_hz,
+                                                 bool take_ownership,
+                                                 void *user_ctx);
+typedef esp_err_t (*llm_client_tts_done_sink_t)(void *user_ctx);
 
 typedef struct {
     const char *system_prompt;        // LLM system prompt；为空时使用 LLM_GATEWAY_SYSTEM_PROMPT。
@@ -219,13 +226,35 @@ esp_err_t llm_client_send_system_status_json(const char *json);
  * @brief 显式 TTS 文本合成接口。
  *
  * 调用方法：speaker bridge 需要播报时调用。函数会通过 Realtime TTS 获取
- * PCM 音频 chunk，并通过 LLM_CLIENT_EVENT_TTS_AUDIO 回调上报；当前不自动接入
- * Mic/Chat 主链路，也不直接播放。
+ * PCM 音频 chunk，并通过 LLM_CLIENT_EVENT_TTS_AUDIO 回调和可选 TTS sink 上报；
+ * 当前不自动接入 Mic/Chat 主链路，也不在本函数内直接播放。
  *
  * @param text 待播报文本，不能为空。
  * @return 成功完成合成返回 ESP_OK；未启用、非空闲、网关错误或超时返回错误码。
  */
 esp_err_t llm_client_tts_text(const char *text);
+
+/**
+ * @brief 注册可选 TTS 音频输出 sink。
+ *
+ * 调用方法：speaker bridge 初始化时注册。Mic bridge 仍只通过 event_cb 接收
+ * ASR/LLM 事件，不需要依赖 speaker 播放器。传 NULL 可取消注册。
+ *
+ * @param sink TTS PCM 音频 sink，可为空。
+ * @param user_ctx 传给 sink 的用户上下文，可为空。
+ */
+void llm_client_set_tts_audio_sink(llm_client_tts_audio_sink_t sink, void *user_ctx);
+
+/**
+ * @brief 注册可选 TTS 完成 sink。
+ *
+ * 调用方法：speaker bridge 用它接收 response.audio.done 对应的收尾信号，
+ * 不依赖 llm_client 的全局 event_cb，因此不会影响 Mic/ASR 事件回调。
+ *
+ * @param sink TTS done sink，可为空。
+ * @param user_ctx 传给 sink 的用户上下文，可为空。
+ */
+void llm_client_set_tts_done_sink(llm_client_tts_done_sink_t sink, void *user_ctx);
 
 /**
  * @brief 查询 TTS 是否启用。

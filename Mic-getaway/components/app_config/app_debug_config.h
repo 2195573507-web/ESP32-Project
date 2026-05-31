@@ -46,6 +46,10 @@
 #define APP_DEBUG_LLM_GATEWAY_PROTO                0  // 网关 JSON 协议组装/解析摘要。
 #define APP_DEBUG_LLM_GATEWAY_AUDIO                0  // 音频 chunk 尺寸日志；不打印 PCM 原始数据。
 
+/* Speaker/IIS 调试：默认关闭，不影响 Mic/ASR 主链路串口输出。 */
+#define APP_DEBUG_BSP_IIS_LOG                    0  // IIS/PDM 底层 GPIO、DMA 配置诊断。
+#define APP_DEBUG_SPEAKER_PLAYER_LOG             0  // speaker 播放器 ringbuffer/DMA/heap 诊断。
+
 /* LLM bridge 调试：默认关闭桥接细节，具体 payload 仍由上面的网关开关控制。 */
 #define APP_DEBUG_MIC_LLM_BRIDGE                   0  // Mic bridge 语音起止和 llm_client 事件细节。
 #define APP_DEBUG_SPEAKER_LLM_BRIDGE               0  // speaker bridge/TTS 合成调用日志。

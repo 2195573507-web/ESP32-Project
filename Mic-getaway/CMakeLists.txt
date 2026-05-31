@@ -2,7 +2,9 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.16)
 
-set(EXTRA_COMPONENT_DIRS components/Middlewares)
+set(EXTRA_COMPONENT_DIRS
+    components/Middlewares
+    components/BSP/IIS)
 add_compile_options(-fdiagnostics-color=always)
 
 

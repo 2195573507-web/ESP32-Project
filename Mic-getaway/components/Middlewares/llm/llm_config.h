@@ -28,7 +28,8 @@
 #define VOLC_GATEWAY_ASR_MODEL                  "bigmodel"                         // Realtime ASR 模型。
 #define LLM_CHAT_MODEL                          "Doubao-Seed-1.6-flash"            // Chat Completions 文本理解/命令决策模型。
 #define VOLC_GATEWAY_CHAT_MODEL                 LLM_CHAT_MODEL                     // 兼容旧命名，Chat 请求统一使用 LLM_CHAT_MODEL。
-#define VOLC_GATEWAY_TTS_MODEL                  "doubao-tts"                       // Realtime TTS 模型。
+#define LLM_MODEL_TTS                           "doubao-tts"                       // Realtime Doubao-TTS 模型。
+#define VOLC_GATEWAY_TTS_MODEL                  LLM_MODEL_TTS                      // 兼容旧命名，TTS 请求统一使用 LLM_MODEL_TTS。
 
 #define VOLC_GATEWAY_ASR_REALTIME_URI           VOLC_GATEWAY_WS_BASE_URL VOLC_GATEWAY_REALTIME_PATH "?model=" VOLC_GATEWAY_ASR_MODEL // ASR Realtime 完整 URI。
 #define VOLC_GATEWAY_CHAT_COMPLETIONS_URI       VOLC_GATEWAY_HTTP_BASE_URL VOLC_GATEWAY_CHAT_PATH // Chat Completions 完整 URI。
@@ -45,13 +46,18 @@
 #define VOLC_GATEWAY_USE_RESOURCE_ID            0                                  // 0 表示不发送 X-Api-Resource-Id。
 #define VOLC_GATEWAY_ASR_RESOURCE_ID            "volc.bigasr.sauc.duration"        // legacy/三方渠道资源 ID，占位保留。
 
-/* TTS 输出参数：当前只启用网关合成能力，播放由 speaker 底层后续接入。 */
-#define VOLC_GATEWAY_TTS_VOICE                  "zh_female_kailangjiejie_moon_bigtts" // 默认中文音色。
-#define VOLC_GATEWAY_TTS_OUTPUT_FORMAT          "pcm"                              // 输出 PCM，便于后续 I2S 播放。
-#define VOLC_GATEWAY_TTS_OUTPUT_SAMPLE_RATE     16000                              // 输出采样率：16 kHz。
+/* TTS 输出参数：严格按边缘大模型网关 Realtime Doubao-TTS 协议组装。 */
+#define LLM_TTS_VOICE                           "zh_female_kailangjiejie_moon_bigtts" // 默认中文音色。
+#define LLM_TTS_OUTPUT_FORMAT                   "pcm"                              // 默认输出 PCM；如仍需网络大包诊断，可临时改为 "mp3" 验证接收稳定性。
+#define LLM_TTS_SAMPLE_RATE                     16000                              // 输出采样率：16 kHz。
+#define LLM_TTS_USE_RESOURCE_ID                 0                                  // 平台预置 doubao-tts 默认不发送 Resource ID。
+#define LLM_TTS_RESOURCE_ID                     "volc.service_type.10029"          // 自有三方渠道 TTS Resource ID，占位保留。
+#define VOLC_GATEWAY_TTS_VOICE                  LLM_TTS_VOICE                      // 兼容旧命名，统一映射到 LLM_TTS_*。
+#define VOLC_GATEWAY_TTS_OUTPUT_FORMAT          LLM_TTS_OUTPUT_FORMAT              // 兼容旧命名，统一映射到 LLM_TTS_*。
+#define VOLC_GATEWAY_TTS_OUTPUT_SAMPLE_RATE     LLM_TTS_SAMPLE_RATE                // 兼容旧命名，统一映射到 LLM_TTS_*。
 #define VOLC_GATEWAY_TTS_OUTPUT_CHANNELS        1                                  // 单声道。
-#define VOLC_GATEWAY_TTS_USE_RESOURCE_ID        0                                  // 平台预置 doubao-tts 默认不发送 Resource ID。
-#define VOLC_GATEWAY_TTS_RESOURCE_ID            "volc.service_type.10029"          // 自有三方渠道 TTS Resource ID，占位保留。
+#define VOLC_GATEWAY_TTS_USE_RESOURCE_ID        LLM_TTS_USE_RESOURCE_ID            // 仅显式打开自有三方渠道模式时发送。
+#define VOLC_GATEWAY_TTS_RESOURCE_ID            LLM_TTS_RESOURCE_ID                // 仅 LLM_TTS_USE_RESOURCE_ID=1 时注入 Header。
 
 /* LLM 内部能力映射：bridge 只选择能力，不直接写具体模型名。 */
 #define LLM_GATEWAY_ASR_MODEL                  VOLC_GATEWAY_ASR_MODEL              // ASR Realtime 模型。
@@ -85,8 +91,11 @@
 #define LLM_GATEWAY_CHAT_TASK_STACK_SIZE       12288                              // ASR final 后发起 Chat 的任务栈。
 #define LLM_GATEWAY_CHAT_TASK_PRIORITY         4                                  // Chat 任务优先级，避免压过 WiFi 系统任务。
 #define LLM_GATEWAY_WS_BUFFER_BYTES            12288                              // 100 ms PCM base64 JSON 发送缓冲。
-#define LLM_GATEWAY_TTS_WS_PAYLOAD_MAX_BYTES   65536                              // TTS 单帧 JSON payload 上限。
-#define LLM_GATEWAY_TTS_AUDIO_CHUNK_MAX_BYTES  32768                              // TTS 单个 base64 delta 解码音频上限。
+#define LLM_TTS_WS_RX_BUFFER_SIZE              16384                              // TTS WebSocket RX/TX 缓冲，覆盖 8KB+ audio.delta JSON。
+#define LLM_TTS_WS_PAYLOAD_MAX                 16384                              // TTS 单帧 JSON payload 上限；超过直接丢弃。
+#define SPEAKER_TTS_MAX_CHUNK_BYTES            12288                              // TTS 单个 PCM chunk 上限；超过直接丢弃。
+#define LLM_GATEWAY_TTS_WS_PAYLOAD_MAX_BYTES   LLM_TTS_WS_PAYLOAD_MAX             // 兼容旧命名，统一使用 LLM_TTS_WS_PAYLOAD_MAX。
+#define LLM_GATEWAY_TTS_AUDIO_CHUNK_MAX_BYTES  SPEAKER_TTS_MAX_CHUNK_BYTES        // 兼容旧命名，统一使用 SPEAKER_TTS_MAX_CHUNK_BYTES。
 #define LLM_GATEWAY_ASR_BASE64_BUFFER_BYTES    5000                               // 100 ms PCM base64 临时缓冲。
 #define LLM_GATEWAY_ASR_JSON_BUFFER_BYTES      8192                               // ASR append JSON 临时缓冲。
 #define LLM_GATEWAY_HTTP_RESPONSE_MAX_BYTES    4096                               // HTTP 响应 JSON 缓冲大小。

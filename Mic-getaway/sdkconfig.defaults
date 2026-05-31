@@ -1,7 +1,8 @@
-# 降低 mbedTLS 单连接收发缓冲，给豆包 ASR WebSocket/TLS 握手保留更多内部 RAM。
-# 注意：已有 sdkconfig 时还需要同步 sdkconfig 中的当前值，本次已同步为 4096。
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
-CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+# Doubao Realtime TTS 的 response.audio.delta 单条 JSON 可能超过 8KB。
+# 这里把 TLS 与 transport_ws 接收缓冲提高到 16KB，避免大 payload 读取中途失败。
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
+CONFIG_WS_BUFFER_SIZE=16384
 
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

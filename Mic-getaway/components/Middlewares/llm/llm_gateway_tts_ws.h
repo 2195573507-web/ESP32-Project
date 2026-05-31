@@ -1,6 +1,7 @@
 #ifndef LLM_GATEWAY_TTS_WS_H
 #define LLM_GATEWAY_TTS_WS_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -25,8 +26,9 @@ typedef enum {
 
 typedef struct {
     llm_gateway_tts_ws_event_type_t type; // 事件类型。
-    const uint8_t *audio;                 // 音频数据，仅 AUDIO_DELTA 有效。
+    uint8_t *audio;                       // 音频数据，仅 AUDIO_DELTA 有效；audio_owned 为 true 时由回调接管。
     size_t audio_len;                     // audio 字节数。
+    bool audio_owned;                     // true 表示 audio 指针 ownership 已转交给回调。
     int code;                             // 错误码或服务端状态码。
     const char *message;                  // 错误/状态说明，可为空。
 } llm_gateway_tts_ws_event_t;
