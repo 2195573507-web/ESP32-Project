@@ -84,15 +84,17 @@ static void llm_gateway_ws_handle_payload(const char *payload, size_t payload_le
         return;
     }
 
-    ESP_LOGI(TAG,
-             "ASR WS event type=%s text_len=%u final=%d partial=%d error=%d",
-             parsed.type[0] != '\0' ? parsed.type : "<unknown>",
-             (unsigned int)strlen(parsed.text),
-             parsed.is_final ? 1 : 0,
-             parsed.is_partial ? 1 : 0,
-             parsed.is_error ? 1 : 0);
-    if (parsed.text[0] != '\0') {
-        ESP_LOGI(TAG, "ASR WS text: %s", parsed.text);
+    if (APP_DEBUG_LLM_GATEWAY_WS) {
+        ESP_LOGI(TAG,
+                 "ASR WS event type=%s text_len=%u final=%d partial=%d error=%d",
+                 parsed.type[0] != '\0' ? parsed.type : "<unknown>",
+                 (unsigned int)strlen(parsed.text),
+                 parsed.is_final ? 1 : 0,
+                 parsed.is_partial ? 1 : 0,
+                 parsed.is_error ? 1 : 0);
+        if (parsed.text[0] != '\0') {
+            ESP_LOGI(TAG, "ASR WS text: %s", parsed.text);
+        }
     }
 
     if (parsed.is_error) {
@@ -281,18 +283,20 @@ esp_err_t llm_gateway_ws_start(const llm_gateway_ws_config_t *config)
     size_t header_len = strlen(s_ws.headers);
     char key_summary[48] = {0};
     volc_gateway_auth_make_key_summary(key_summary, sizeof(key_summary));
-    ESP_LOGI(TAG,
-             "ASR WS connect uri=%s model=%s gateway_mode=%d key=%s headers=[Authorization%s] header_len=%u",
-             VOLC_GATEWAY_ASR_REALTIME_URI,
-             s_ws.asr_model,
-             LLM_CLIENT_USE_VOLC_GATEWAY,
-             key_summary,
+    if (APP_DEBUG_LLM_GATEWAY_WS) {
+        ESP_LOGI(TAG,
+                 "ASR WS connect uri=%s model=%s gateway_mode=%d key=%s headers=[Authorization%s] header_len=%u",
+                 VOLC_GATEWAY_ASR_REALTIME_URI,
+                 s_ws.asr_model,
+                 LLM_CLIENT_USE_VOLC_GATEWAY,
+                 key_summary,
 #if VOLC_GATEWAY_USE_RESOURCE_ID
-             ",X-Api-Resource-Id",
+                 ",X-Api-Resource-Id",
 #else
-             "",
+                 "",
 #endif
-             (unsigned int)header_len);
+                 (unsigned int)header_len);
+    }
 
     esp_websocket_client_config_t ws_config = {
         .uri = VOLC_GATEWAY_ASR_REALTIME_URI,
@@ -432,10 +436,10 @@ esp_err_t llm_gateway_ws_finish(void)
                                               pdMS_TO_TICKS(LLM_GATEWAY_WS_SEND_TIMEOUT_MS));
     llm_gateway_protocol_free(finish_json);
     ret = sent < 0 ? ESP_FAIL : ESP_OK;
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "ASR finalize sent");
-    } else {
+    if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ASR finalize send result: %s", esp_err_to_name(ret));
+    } else if (APP_DEBUG_LLM_GATEWAY_WS) {
+        ESP_LOGI(TAG, "ASR finalize sent");
     }
     return ret;
 }
@@ -462,20 +466,22 @@ esp_err_t llm_gateway_ws_stop(void)
     }
     if (had_client) {
         const bool close_ok = close_ret == ESP_OK && stop_ret == ESP_OK && destroy_ret == ESP_OK;
-        if (close_ok) {
-            ESP_LOGI(TAG,
-                     "ASR websocket closed: connected=%d close=%s stop=%s destroy=%s",
-                     was_connected ? 1 : 0,
-                     esp_err_to_name(close_ret),
-                     esp_err_to_name(stop_ret),
-                     esp_err_to_name(destroy_ret));
-        } else {
-            ESP_LOGW(TAG,
-                     "ASR websocket closed with warning: connected=%d close=%s stop=%s destroy=%s",
-                     was_connected ? 1 : 0,
-                     esp_err_to_name(close_ret),
-                     esp_err_to_name(stop_ret),
-                     esp_err_to_name(destroy_ret));
+        if (APP_DEBUG_LLM_GATEWAY_WS) {
+            if (close_ok) {
+                ESP_LOGD(TAG,
+                         "ASR websocket closed: connected=%d close=%s stop=%s destroy=%s",
+                         was_connected ? 1 : 0,
+                         esp_err_to_name(close_ret),
+                         esp_err_to_name(stop_ret),
+                         esp_err_to_name(destroy_ret));
+            } else {
+                ESP_LOGD(TAG,
+                         "ASR websocket closed with cleanup result: connected=%d close=%s stop=%s destroy=%s",
+                         was_connected ? 1 : 0,
+                         esp_err_to_name(close_ret),
+                         esp_err_to_name(stop_ret),
+                         esp_err_to_name(destroy_ret));
+            }
         }
     }
     memset(&s_ws, 0, sizeof(s_ws));

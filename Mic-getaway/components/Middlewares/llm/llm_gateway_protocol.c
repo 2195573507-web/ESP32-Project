@@ -11,6 +11,9 @@
 
 static const char *TAG = "llm_gateway_proto";
 
+#define LLM_GATEWAY_CHAT_PARSE_PREVIEW_BYTES     1024U
+#define LLM_GATEWAY_CHAT_REASONING_PREVIEW_BYTES 160U
+
 static const cJSON *llm_gateway_protocol_get_path(const cJSON *root,
                                                   const char *first,
                                                   const char *second,
@@ -42,6 +45,157 @@ static bool llm_gateway_protocol_copy_json_string(const cJSON *item,
     return true;
 }
 
+static bool llm_gateway_protocol_append_json_string(const cJSON *item,
+                                                    char *out,
+                                                    size_t out_size)
+{
+    if (!cJSON_IsString(item) || item->valuestring == NULL ||
+        item->valuestring[0] == '\0' || out == NULL || out_size == 0) {
+        return false;
+    }
+
+    size_t used = strlen(out);
+    if (used + 1U >= out_size) {
+        return false;
+    }
+
+    strlcpy(out + used, item->valuestring, out_size - used);
+    return true;
+}
+
+static const char *llm_gateway_protocol_trim_leading_chat_body(const char *body)
+{
+    const unsigned char *cursor = (const unsigned char *)body;
+    bool moved = true;
+    while (moved) {
+        moved = false;
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' ||
+               *cursor == '\n' || *cursor == '\v' || *cursor == '\f') {
+            cursor++;
+            moved = true;
+        }
+        if (cursor[0] == 0xEF && cursor[1] == 0xBB && cursor[2] == 0xBF) {
+            cursor += 3;
+            moved = true;
+        }
+    }
+    return (const char *)cursor;
+}
+
+static const char *llm_gateway_protocol_trim_line_left(const char *line, size_t *line_len)
+{
+    while (*line_len > 0 &&
+           (line[0] == ' ' || line[0] == '\t' || line[0] == '\r')) {
+        line++;
+        (*line_len)--;
+    }
+    return line;
+}
+
+static void llm_gateway_protocol_trim_line_right(size_t *line_len, const char *line)
+{
+    while (*line_len > 0) {
+        char last = line[*line_len - 1U];
+        if (last != ' ' && last != '\t' && last != '\r') {
+            break;
+        }
+        (*line_len)--;
+    }
+}
+
+static void llm_gateway_protocol_log_parse_diagnostics(const char *body,
+                                                       const char *parser_mode,
+                                                       const char *payload,
+                                                       const char *error_ptr)
+{
+    const char *safe_body = body != NULL ? body : "";
+    const char *safe_mode = parser_mode != NULL ? parser_mode : "unknown";
+    const bool log_body_preview = APP_DEBUG_LLM_GATEWAY_HTTP || APP_DEBUG_LLM_GATEWAY_PROTO;
+    size_t body_len = strlen(safe_body);
+    size_t preview_len = body_len;
+    if (preview_len > LLM_GATEWAY_CHAT_PARSE_PREVIEW_BYTES) {
+        preview_len = LLM_GATEWAY_CHAT_PARSE_PREVIEW_BYTES;
+    }
+
+    ESP_LOGW(TAG,
+             "Chat response parse failed: body_len=%u parser_mode=%s",
+             (unsigned int)body_len,
+             safe_mode);
+    if (log_body_preview) {
+        ESP_LOGW(TAG, "Chat response body_preview: %.*s", (int)preview_len, safe_body);
+    }
+
+    if (error_ptr == NULL) {
+        ESP_LOGW(TAG, "cJSON_Parse error_ptr=<null>");
+        return;
+    }
+
+    const char *safe_payload = payload != NULL ? payload : safe_body;
+    size_t payload_len = strlen(safe_payload);
+    if (error_ptr >= safe_payload && error_ptr <= safe_payload + payload_len) {
+        size_t error_offset = (size_t)(error_ptr - safe_payload);
+        ESP_LOGW(TAG,
+                 "cJSON_Parse error_offset=%u error_ptr=%p",
+                 (unsigned int)error_offset,
+                 (const void *)error_ptr);
+        if (log_body_preview) {
+            ESP_LOGW(TAG, "cJSON_Parse near: %.*s", 96, error_ptr);
+        }
+    } else {
+        ESP_LOGW(TAG, "cJSON_Parse error_ptr=%p", (const void *)error_ptr);
+        if (log_body_preview) {
+            ESP_LOGW(TAG, "cJSON_Parse near: %.*s", 96, error_ptr);
+        }
+    }
+}
+
+static void llm_gateway_protocol_log_json_string_preview(const char *field,
+                                                         const cJSON *item)
+{
+    if (!APP_DEBUG_LLM_GATEWAY_PROTO) {
+        return;
+    }
+    if (!cJSON_IsString(item) || item->valuestring == NULL || item->valuestring[0] == '\0') {
+        return;
+    }
+
+    size_t preview_len = strlen(item->valuestring);
+    if (preview_len > LLM_GATEWAY_CHAT_REASONING_PREVIEW_BYTES) {
+        preview_len = LLM_GATEWAY_CHAT_REASONING_PREVIEW_BYTES;
+    }
+    ESP_LOGI(TAG,
+             "Chat %s ignored as final reply: %.*s",
+             field != NULL ? field : "reasoning_content",
+             (int)preview_len,
+             item->valuestring);
+}
+
+static void llm_gateway_protocol_log_reasoning_candidates(const cJSON *choice)
+{
+    if (choice == NULL) {
+        return;
+    }
+
+    llm_gateway_protocol_log_json_string_preview(
+        "message.reasoning_content",
+        llm_gateway_protocol_get_path(choice, "message", "reasoning_content", NULL));
+    llm_gateway_protocol_log_json_string_preview(
+        "message.thinking_content",
+        llm_gateway_protocol_get_path(choice, "message", "thinking_content", NULL));
+    llm_gateway_protocol_log_json_string_preview(
+        "delta.reasoning_content",
+        llm_gateway_protocol_get_path(choice, "delta", "reasoning_content", NULL));
+    llm_gateway_protocol_log_json_string_preview(
+        "delta.thinking_content",
+        llm_gateway_protocol_get_path(choice, "delta", "thinking_content", NULL));
+    llm_gateway_protocol_log_json_string_preview(
+        "reasoning_content",
+        cJSON_GetObjectItemCaseSensitive(choice, "reasoning_content"));
+    llm_gateway_protocol_log_json_string_preview(
+        "thinking_content",
+        cJSON_GetObjectItemCaseSensitive(choice, "thinking_content"));
+}
+
 static bool llm_gateway_protocol_extract_text_candidates(const cJSON *root,
                                                          char *out_text,
                                                          size_t out_size)
@@ -54,6 +208,7 @@ static bool llm_gateway_protocol_extract_text_candidates(const cJSON *root,
             llm_gateway_protocol_copy_json_string(cJSON_GetObjectItemCaseSensitive(choice, "text"), out_text, out_size)) {
             return true;
         }
+        llm_gateway_protocol_log_reasoning_candidates(choice);
     }
 
     if (llm_gateway_protocol_copy_json_string(cJSON_GetObjectItemCaseSensitive(root, "text"), out_text, out_size) ||
@@ -69,6 +224,104 @@ static bool llm_gateway_protocol_extract_text_candidates(const cJSON *root,
     }
 
     return false;
+}
+
+static bool llm_gateway_protocol_append_sse_text_candidates(const cJSON *root,
+                                                            char *out_text,
+                                                            size_t out_size)
+{
+    const cJSON *item = llm_gateway_protocol_get_path(root, "choices", NULL, NULL);
+    if (!cJSON_IsArray(item)) {
+        return false;
+    }
+
+    const cJSON *choice = cJSON_GetArrayItem(item, 0);
+    if (llm_gateway_protocol_append_json_string(llm_gateway_protocol_get_path(choice, "delta", "content", NULL), out_text, out_size) ||
+        llm_gateway_protocol_append_json_string(llm_gateway_protocol_get_path(choice, "message", "content", NULL), out_text, out_size)) {
+        return true;
+    }
+
+    llm_gateway_protocol_log_reasoning_candidates(choice);
+    return false;
+}
+
+static esp_err_t llm_gateway_protocol_parse_chat_json(const char *body,
+                                                      const char *json,
+                                                      char *out_text,
+                                                      size_t out_size)
+{
+    cJSON *root = cJSON_Parse(json);
+    if (root == NULL) {
+        llm_gateway_protocol_log_parse_diagnostics(body, "json", json, cJSON_GetErrorPtr());
+        return ESP_FAIL;
+    }
+
+    bool found = llm_gateway_protocol_extract_text_candidates(root, out_text, out_size);
+    cJSON_Delete(root);
+    if (!found) {
+        llm_gateway_protocol_log_parse_diagnostics(body, "json", json, NULL);
+    }
+    return found ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t llm_gateway_protocol_parse_chat_sse(const char *body,
+                                                     const char *sse,
+                                                     char *out_text,
+                                                     size_t out_size)
+{
+    bool parsed_payload = false;
+    bool found_text = false;
+    const char *line = sse;
+
+    while (line != NULL && line[0] != '\0') {
+        const char *line_end = strchr(line, '\n');
+        size_t line_len = line_end != NULL ? (size_t)(line_end - line) : strlen(line);
+        const char *line_start = llm_gateway_protocol_trim_line_left(line, &line_len);
+        llm_gateway_protocol_trim_line_right(&line_len, line_start);
+
+        if (line_len >= 5U && strncmp(line_start, "data:", 5) == 0) {
+            const char *payload = line_start + 5;
+            size_t payload_len = line_len - 5U;
+            payload = llm_gateway_protocol_trim_line_left(payload, &payload_len);
+            llm_gateway_protocol_trim_line_right(&payload_len, payload);
+
+            if (payload_len > 0 &&
+                !(payload_len == 6U && strncmp(payload, "[DONE]", 6) == 0)) {
+                char *payload_json = (char *)malloc(payload_len + 1U);
+                if (payload_json == NULL) {
+                    return ESP_ERR_NO_MEM;
+                }
+                memcpy(payload_json, payload, payload_len);
+                payload_json[payload_len] = '\0';
+
+                cJSON *root = cJSON_Parse(payload_json);
+                if (root == NULL) {
+                    llm_gateway_protocol_log_parse_diagnostics(body, "sse", payload_json, cJSON_GetErrorPtr());
+                    free(payload_json);
+                    return ESP_FAIL;
+                }
+
+                parsed_payload = true;
+                if (llm_gateway_protocol_append_sse_text_candidates(root, out_text, out_size)) {
+                    found_text = true;
+                }
+                cJSON_Delete(root);
+                free(payload_json);
+            }
+        }
+
+        if (line_end == NULL) {
+            break;
+        }
+        line = line_end + 1;
+    }
+
+    if (found_text) {
+        return ESP_OK;
+    }
+
+    llm_gateway_protocol_log_parse_diagnostics(body, "sse", sse, NULL);
+    return parsed_payload ? ESP_ERR_NOT_FOUND : ESP_FAIL;
 }
 
 esp_err_t llm_gateway_protocol_build_auth_header(char *out, size_t out_size)
@@ -146,15 +399,18 @@ esp_err_t llm_gateway_protocol_parse_chat_response(const char *json,
     }
     out_text[0] = '\0';
 
-    cJSON *root = cJSON_Parse(json);
-    if (root == NULL) {
-        ESP_LOGW(TAG, "LLM response is not valid JSON");
-        return ESP_FAIL;
+    const char *body = json;
+    const char *trimmed = llm_gateway_protocol_trim_leading_chat_body(body);
+    if (strncmp(trimmed, "data:", 5) == 0) {
+        return llm_gateway_protocol_parse_chat_sse(body, trimmed, out_text, out_size);
     }
 
-    bool found = llm_gateway_protocol_extract_text_candidates(root, out_text, out_size);
-    cJSON_Delete(root);
-    return found ? ESP_OK : ESP_ERR_NOT_FOUND;
+    if (trimmed[0] == '{') {
+        return llm_gateway_protocol_parse_chat_json(body, trimmed, out_text, out_size);
+    }
+
+    llm_gateway_protocol_log_parse_diagnostics(body, "unknown", trimmed, NULL);
+    return ESP_FAIL;
 }
 
 esp_err_t llm_gateway_protocol_build_asr_ws_start_event(const char *model,

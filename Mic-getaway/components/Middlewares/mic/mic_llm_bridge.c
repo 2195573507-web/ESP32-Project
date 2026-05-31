@@ -8,6 +8,8 @@
 
 static const char *TAG = "mic_llm_bridge";
 
+#define MIC_LLM_BRIDGE_CHAT_HTTP_403_ERROR_CODE 264
+
 static bool s_mic_llm_bridge_initialized;
 
 static const char *mic_llm_bridge_event_name(llm_client_event_type_t type)
@@ -44,6 +46,13 @@ static void mic_llm_bridge_event_cb(const llm_client_event_t *event, void *user_
     }
 
     if (event->type == LLM_CLIENT_EVENT_ERROR) {
+        if (event->code == MIC_LLM_BRIDGE_CHAT_HTTP_403_ERROR_CODE) {
+            ESP_LOGE(TAG,
+                     "code=%d message=%s",
+                     event->code,
+                     event->message != NULL ? event->message : "<none>");
+            return;
+        }
         ESP_LOGE(TAG,
                  "LLM event error: code=%d message=%s",
                  event->code,
@@ -59,12 +68,14 @@ static void mic_llm_bridge_event_cb(const llm_client_event_t *event, void *user_
         return;
     }
     if (event->type == LLM_CLIENT_EVENT_TTS_AUDIO) {
-        ESP_LOGI(TAG, "LLM event tts_audio: bytes=%u",
-                 (unsigned int)event->audio_len);
+        if (APP_DEBUG_MIC_LLM_BRIDGE && APP_DEBUG_LLM_GATEWAY_AUDIO) {
+            ESP_LOGI(TAG, "LLM event tts_audio: bytes=%u",
+                     (unsigned int)event->audio_len);
+        }
         return;
     }
 
-    if (event->text != NULL && event->text[0] != '\0') {
+    if (APP_DEBUG_MIC_LLM_BRIDGE && event->text != NULL && event->text[0] != '\0') {
         ESP_LOGI(TAG, "LLM event %s: %s", mic_llm_bridge_event_name(event->type), event->text);
     } else if (APP_DEBUG_MIC_LLM_BRIDGE) {
         ESP_LOGI(TAG, "LLM event %s", mic_llm_bridge_event_name(event->type));
@@ -89,7 +100,9 @@ esp_err_t ai_mic_bridge_init(void)
     }
 
     s_mic_llm_bridge_initialized = true;
-    ESP_LOGI(TAG, "Mic LLM bridge initialized");
+    if (APP_DEBUG_MIC_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "Mic LLM bridge initialized");
+    }
     return ESP_OK;
 }
 
@@ -100,14 +113,18 @@ esp_err_t ai_mic_bridge_voice_start(void)
     }
     llm_client_state_t state = llm_client_get_state();
     if (state == LLM_CLIENT_STATE_ASR_FINISHING) {
-        ESP_LOGI(TAG, "ASR busy finishing previous session");
+        if (APP_DEBUG_MIC_LLM_BRIDGE) {
+            ESP_LOGI(TAG, "ASR busy finishing previous session");
+        }
         return ESP_ERR_INVALID_STATE;
     }
     if (state != LLM_CLIENT_STATE_IDLE) {
         ESP_LOGW(TAG, "voice_start rejected: llm_client state=%s", llm_client_state_name(state));
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(TAG, "voice_start");
+    if (APP_DEBUG_MIC_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "voice_start");
+    }
     return llm_client_start_asr_session();
 }
 
@@ -135,7 +152,9 @@ esp_err_t ai_mic_bridge_voice_end(void)
     if (!s_mic_llm_bridge_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(TAG, "voice_end");
+    if (APP_DEBUG_MIC_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "voice_end");
+    }
     if (!llm_client_is_voice_session_active()) {
         return ESP_OK;
     }
@@ -153,7 +172,9 @@ esp_err_t ai_mic_bridge_voice_cancel(void)
     if (!s_mic_llm_bridge_initialized) {
         return ESP_OK;
     }
-    ESP_LOGI(TAG, "session stop");
+    if (APP_DEBUG_MIC_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "session stop");
+    }
     return llm_client_cancel_asr_session();
 }
 
@@ -179,16 +200,16 @@ const char *ai_mic_bridge_state_name(void)
 
 esp_err_t ai_mic_bridge_on_asr_partial(const char *text)
 {
-    if (text != NULL && text[0] != '\0') {
-        ESP_LOGI(TAG, "ASR PARTIAL: %s", text);
+    if (APP_DEBUG_MIC_LLM_BRIDGE && text != NULL && text[0] != '\0') {
+        ESP_LOGI(TAG, "ASR partial: %s", text);
     }
     return ESP_OK;
 }
 
 esp_err_t ai_mic_bridge_on_asr_final(const char *text)
 {
-    if (text != NULL && text[0] != '\0') {
-        ESP_LOGI(TAG, "ASR FINAL: %s", text);
+    if (APP_DEBUG_MIC_LLM_BRIDGE && text != NULL && text[0] != '\0') {
+        ESP_LOGI(TAG, "ASR final bridge: %s", text);
     }
     return ESP_OK;
 }

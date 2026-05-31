@@ -152,7 +152,7 @@ static esp_err_t connect_selected_wifi(const known_wifi_t *selected_wifi, int8_t
 
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_DISCONNECTED_BIT);
 
-    ESP_LOGI(TAG, "Connecting to SSID: %s, RSSI: %d", selected_wifi->ssid, selected_rssi);
+    ESP_LOGD(TAG, "Connecting to SSID: %s, RSSI: %d", selected_wifi->ssid, selected_rssi);
 
     ret = esp_wifi_connect();
     if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
@@ -209,7 +209,7 @@ static void wifi_reconnect_task(void *arg)
                                                    pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
 
             if (bits & WIFI_CONNECTED_BIT) {
-                ESP_LOGI(TAG, "Wi-Fi connected");
+                ESP_LOGD(TAG, "Wi-Fi connected");
                 break;
             }
 
@@ -254,10 +254,10 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         xEventGroupSetBits(s_wifi_event_group, WIFI_RECONNECT_BIT | WIFI_DISCONNECTED_BIT);
         s_wifi_connected_tick = 0;
-        ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d, rescan scheduled", reason);
+        ESP_LOGI(TAG, "WiFi disconnected: reason=%d", reason);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGD(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupClearBits(s_wifi_event_group, WIFI_RECONNECT_BIT | WIFI_DISCONNECTED_BIT);
         s_wifi_connected_tick = xTaskGetTickCount();
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
@@ -347,7 +347,7 @@ esp_err_t wifi_connect_to_ap(void)
 
     // 首次调用时主动触发扫描；后续断线由事件处理函数自动触发。
     xEventGroupSetBits(s_wifi_event_group, WIFI_RECONNECT_BIT);
-    ESP_LOGI(TAG, "Waiting for Wi-Fi connection");
+    ESP_LOGD(TAG, "Waiting for Wi-Fi connection");
 
     xEventGroupWaitBits(s_wifi_event_group,
                         WIFI_CONNECTED_BIT,

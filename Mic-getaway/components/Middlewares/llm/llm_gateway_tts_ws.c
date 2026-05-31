@@ -88,7 +88,11 @@ static esp_err_t llm_gateway_tts_ws_send_json(char *json,
                                               (int)json_len,
                                               pdMS_TO_TICKS(LLM_GATEWAY_WS_SEND_TIMEOUT_MS));
     esp_err_t ret = sent < 0 ? ESP_FAIL : ESP_OK;
-    ESP_LOGI(TAG, "TTS %s send result: %s", event_name, esp_err_to_name(ret));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "TTS %s send result: %s", event_name, esp_err_to_name(ret));
+    } else if (APP_DEBUG_LLM_GATEWAY_WS) {
+        ESP_LOGI(TAG, "TTS %s send result: %s", event_name, esp_err_to_name(ret));
+    }
     return ret;
 }
 
@@ -151,12 +155,14 @@ static void llm_gateway_tts_ws_handle_payload(const char *payload, size_t payloa
         return;
     }
 
-    ESP_LOGI(TAG,
-             "TTS WS event type=%s audio_len=%u done=%d error=%d",
-             parsed.type[0] != '\0' ? parsed.type : "<unknown>",
-             (unsigned int)parsed.audio_len,
-             parsed.is_audio_done ? 1 : 0,
-             parsed.is_error ? 1 : 0);
+    if (APP_DEBUG_LLM_GATEWAY_WS) {
+        ESP_LOGI(TAG,
+                 "TTS WS event type=%s audio_len=%u done=%d error=%d",
+                 parsed.type[0] != '\0' ? parsed.type : "<unknown>",
+                 (unsigned int)parsed.audio_len,
+                 parsed.is_audio_done ? 1 : 0,
+                 parsed.is_error ? 1 : 0);
+    }
 
     if (parsed.is_error) {
         xEventGroupSetBits(s_tts.event_group, LLM_GATEWAY_TTS_WS_ERROR_BIT);
@@ -337,17 +343,17 @@ static esp_err_t llm_gateway_tts_ws_stop(void)
     if (s_tts.event_group != NULL) {
         vEventGroupDelete(s_tts.event_group);
     }
-    if (had_client) {
+    if (had_client && APP_DEBUG_LLM_GATEWAY_WS) {
         if (close_ret == ESP_OK && stop_ret == ESP_OK && destroy_ret == ESP_OK) {
-            ESP_LOGI(TAG,
+            ESP_LOGD(TAG,
                      "TTS websocket closed: connected=%d close=%s stop=%s destroy=%s",
                      was_connected ? 1 : 0,
                      esp_err_to_name(close_ret),
                      esp_err_to_name(stop_ret),
                      esp_err_to_name(destroy_ret));
         } else {
-            ESP_LOGW(TAG,
-                     "TTS websocket closed with warning: connected=%d close=%s stop=%s destroy=%s",
+            ESP_LOGD(TAG,
+                     "TTS websocket closed with cleanup result: connected=%d close=%s stop=%s destroy=%s",
                      was_connected ? 1 : 0,
                      esp_err_to_name(close_ret),
                      esp_err_to_name(stop_ret),
@@ -432,21 +438,23 @@ esp_err_t llm_gateway_tts_ws_synthesize(const llm_gateway_tts_ws_config_t *confi
     size_t header_len = strlen(s_tts.headers);
     char key_summary[48] = {0};
     volc_gateway_auth_make_key_summary(key_summary, sizeof(key_summary));
-    ESP_LOGI(TAG,
-             "TTS WS connect uri=%s model=%s voice=%s format=%s sample_rate=%d key=%s headers=[Authorization%s] header_len=%u text_len=%u",
-             VOLC_GATEWAY_TTS_REALTIME_URI,
-             s_tts.tts_model,
-             VOLC_GATEWAY_TTS_VOICE,
-             VOLC_GATEWAY_TTS_OUTPUT_FORMAT,
-             VOLC_GATEWAY_TTS_OUTPUT_SAMPLE_RATE,
-             key_summary,
+    if (APP_DEBUG_LLM_GATEWAY_WS) {
+        ESP_LOGI(TAG,
+                 "TTS WS connect uri=%s model=%s voice=%s format=%s sample_rate=%d key=%s headers=[Authorization%s] header_len=%u text_len=%u",
+                 VOLC_GATEWAY_TTS_REALTIME_URI,
+                 s_tts.tts_model,
+                 VOLC_GATEWAY_TTS_VOICE,
+                 VOLC_GATEWAY_TTS_OUTPUT_FORMAT,
+                 VOLC_GATEWAY_TTS_OUTPUT_SAMPLE_RATE,
+                 key_summary,
 #if VOLC_GATEWAY_TTS_USE_RESOURCE_ID
-             ",X-Api-Resource-Id",
+                 ",X-Api-Resource-Id",
 #else
-             "",
+                 "",
 #endif
-             (unsigned int)header_len,
-             (unsigned int)strlen(text));
+                 (unsigned int)header_len,
+                 (unsigned int)strlen(text));
+    }
 
     esp_websocket_client_config_t ws_config = {
         .uri = VOLC_GATEWAY_TTS_REALTIME_URI,
@@ -539,13 +547,15 @@ esp_err_t llm_gateway_tts_ws_synthesize(const llm_gateway_tts_ws_config_t *confi
         ESP_LOGW(TAG, "TTS audio.done received without audio delta");
         ret = ESP_ERR_NOT_FOUND;
     } else {
-        ESP_LOGI(TAG, "TTS synth finished");
+        if (APP_DEBUG_SPEAKER_LLM_BRIDGE) {
+            ESP_LOGI(TAG, "TTS synth finished");
+        }
         ret = ESP_OK;
     }
 
     esp_err_t close_ret = llm_gateway_tts_ws_stop();
-    if (ret == ESP_OK && close_ret != ESP_OK) {
-        ESP_LOGW(TAG, "TTS close warning ignored after synth complete: %s", esp_err_to_name(close_ret));
+    if (ret == ESP_OK && close_ret != ESP_OK && APP_DEBUG_LLM_GATEWAY_WS) {
+        ESP_LOGD(TAG, "TTS close cleanup result after synth complete: %s", esp_err_to_name(close_ret));
     }
     return ret;
 }

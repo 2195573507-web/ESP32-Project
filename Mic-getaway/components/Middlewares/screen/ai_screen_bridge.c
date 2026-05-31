@@ -1,12 +1,15 @@
 #include "ai_screen_bridge.h"
 
+#include "app_debug_config.h"
 #include "esp_log.h"
 
 static const char *TAG = "ai_screen_bridge";
 
 esp_err_t ai_screen_bridge_init(void)
 {
-    ESP_LOGI(TAG, "screen bridge reserved");
+    if (APP_DEBUG_SCREEN_BRIDGE) {
+        ESP_LOGI(TAG, "screen bridge reserved");
+    }
     return ESP_OK;
 }
 
@@ -16,12 +19,14 @@ esp_err_t ai_screen_bridge_execute(const ai_screen_command_t *cmd)
         return ESP_ERR_INVALID_ARG;
     }
 
-    ESP_LOGI(TAG,
-             "screen cmd type=%d title=%s text=%s timeout_ms=%d",
-             (int)cmd->type,
-             cmd->title != NULL ? cmd->title : "",
-             cmd->text != NULL ? cmd->text : "",
-             cmd->timeout_ms);
+    if (APP_DEBUG_SCREEN_BRIDGE) {
+        ESP_LOGI(TAG,
+                 "screen cmd type=%d title=%s text=%s timeout_ms=%d",
+                 (int)cmd->type,
+                 cmd->title != NULL ? cmd->title : "",
+                 cmd->text != NULL ? cmd->text : "",
+                 cmd->timeout_ms);
+    }
     return ESP_OK;
 }
 

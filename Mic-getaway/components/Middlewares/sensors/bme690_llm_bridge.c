@@ -15,7 +15,9 @@ esp_err_t bme690_llm_bridge_init(void)
 
 esp_err_t ai_bme690_bridge_init(void)
 {
-    ESP_LOGI(TAG, "BME690 bridge reserved");
+    if (APP_DEBUG_BME690_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "BME690 bridge reserved");
+    }
     return ESP_OK;
 }
 
@@ -66,7 +68,9 @@ esp_err_t ai_bme690_bridge_report(float temperature_c,
     if (ret != ESP_OK) {
         return ret;
     }
-    ESP_LOGI(TAG, "%s", context);
+    if (APP_DEBUG_BME690_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "%s", context);
+    }
     return ESP_OK;
 }
 
@@ -116,7 +120,9 @@ esp_err_t bme690_llm_bridge_send_json(const char *json)
     if (json == NULL || json[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
-    ESP_LOGI(TAG, "BME690 JSON reserved");
+    if (APP_DEBUG_BME690_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "BME690 JSON reserved");
+    }
     return llm_client_send_bme690_json(json);
 }
 

@@ -16,7 +16,9 @@ esp_err_t csi_llm_bridge_init(void)
 
 esp_err_t ai_csi_bridge_init(void)
 {
-    ESP_LOGI(TAG, "CSI bridge reserved");
+    if (APP_DEBUG_CSI_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "CSI bridge reserved");
+    }
     return ESP_OK;
 }
 
@@ -56,7 +58,9 @@ esp_err_t ai_csi_bridge_report(const ai_csi_summary_t *summary)
     if (ret != ESP_OK) {
         return ret;
     }
-    ESP_LOGI(TAG, "%s", context);
+    if (APP_DEBUG_CSI_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "%s", context);
+    }
     return ESP_OK;
 }
 
@@ -96,7 +100,9 @@ esp_err_t csi_llm_bridge_send_json(const char *json)
     if (json == NULL || json[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
-    ESP_LOGI(TAG, "CSI JSON reserved");
+    if (APP_DEBUG_CSI_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "CSI JSON reserved");
+    }
     return llm_client_send_csi_json(json);
 }
 

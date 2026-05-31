@@ -33,6 +33,8 @@
 #define MIC_ADC_ASR_PRE_ROLL_MS        (APP_ASR_AUDIO_PACKET_MS * APP_ASR_PRE_SPEECH_PACKETS) // VOICE_START 前保留 3~5 个 ASR 包的句首 PCM。
 #define MIC_ADC_ASR_PRE_ROLL_MAX_MS    1000 // 预缓存上限，防止静态 RAM 误增。
 #define MIC_ADC_ASR_PRE_ROLL_SAMPLES   ((MIC_ADC_SAMPLE_FREQ_HZ * MIC_ADC_ASR_PRE_ROLL_MS) / 1000) // 预缓存样本数。
+#define MIC_ADC_ASR_POST_ROLL_MS       APP_ASR_POST_ROLL_MS // VOICE_END 后继续发送的尾部 PCM 时长。
+#define MIC_ADC_ASR_POST_ROLL_SAMPLES  ((MIC_ADC_SAMPLE_FREQ_HZ * MIC_ADC_ASR_POST_ROLL_MS) / 1000) // 尾部补偿样本数。
 #define MIC_ADC_ASR_LIVE_CHUNK_SAMPLES 160  // 实时发送块，160 samples = 10 ms PCM。
 #define MIC_ADC_ASR_RETRY_DELAY_MS      2000 // ASR session 启动失败后等待 2 秒再允许下一次启动，避免断网时疯狂重连。
 
@@ -42,6 +44,10 @@
 
 #if MIC_ADC_ASR_PRE_ROLL_MS > MIC_ADC_ASR_PRE_ROLL_MAX_MS
 #error "MIC_ADC_ASR_PRE_ROLL_MS must not exceed MIC_ADC_ASR_PRE_ROLL_MAX_MS"
+#endif
+
+#if MIC_ADC_ASR_POST_ROLL_MS < 0 || MIC_ADC_ASR_POST_ROLL_MS > 1000
+#error "MIC_ADC_ASR_POST_ROLL_MS must be between 0 and 1000"
 #endif
 
 #if MIC_ADC_ASR_RETRY_DELAY_MS < 1000 || MIC_ADC_ASR_RETRY_DELAY_MS > 3000
@@ -58,7 +64,7 @@
  * 1. WiFi 稳定后启动 ADC continuous。
  * 2. ADC 任务采到 PCM 后先进入 IDLE，只维护句首 pre-roll。
  * 3. VAD 触发 VOICE_START 时才启动一次豆包 ASR 会话并进入 STREAMING。
- * 4. 外层 VAD 触发 VOICE_END，或豆包本地 RMS VAD 已收到 FINAL 后进入 FINISHING；
+ * 4. 外层 VAD 触发 VOICE_END 后先发送 post-roll，再进入 FINISHING；
  *    finish/stop 完成本轮 session 后回到 IDLE，继续等待下一次说话。
  *
  * @return 成功返回 ESP_OK，失败返回 ESP-IDF 错误码。

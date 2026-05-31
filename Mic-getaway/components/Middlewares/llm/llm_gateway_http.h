@@ -23,12 +23,14 @@
  * @param user_text 用户文本，不能为空。
  * @param out_text 输出回复文本缓冲区，不能为空。
  * @param out_text_size out_text 字节数，必须大于 0。
+ * @param out_status_code 可选输出 HTTP 状态码；没有进入 HTTP 响应阶段时为 0。
  * @return 成功返回 ESP_OK；HTTP 请求、JSON 解析或参数错误时返回错误码。
  */
 esp_err_t llm_gateway_http_chat_completion(const char *model,
                                            const char *system_prompt,
                                            const char *user_text,
                                            char *out_text,
-                                           size_t out_text_size);
+                                           size_t out_text_size,
+                                           int *out_status_code);
 
 #endif // LLM_GATEWAY_HTTP_H

@@ -16,7 +16,7 @@
 #define LLM_CLIENT_USE_VOLC_GATEWAY             1                                  // 1 表示启用网关模式。
 
 /* 网关鉴权：API Key 只允许放在本配置文件；日志只能打印长度和脱敏摘要。 */
-#define VOLC_GATEWAY_API_KEY                    "请填入火山引擎网关 API Key"        // 网关 API Key，禁止明文打印。
+#define VOLC_GATEWAY_API_KEY                    "sk-12d89cfd90bd4846b3f2ed399540cea75bjjw6shymxhmm86"        // 网关 API Key，禁止明文打印。
 
 /* 网关地址：主链路代码只能使用下面组合出来的 URI，不要散落写域名或 path。 */
 #define VOLC_GATEWAY_WS_BASE_URL                "wss://ai-gateway.vei.volces.com"  // WebSocket 网关根地址。
@@ -26,7 +26,8 @@
 
 /* 模型名集中配置：bridge 只选择能力，不直接写模型字符串。 */
 #define VOLC_GATEWAY_ASR_MODEL                  "bigmodel"                         // Realtime ASR 模型。
-#define VOLC_GATEWAY_CHAT_MODEL                 "Doubao-Seed-1.6-flash"            // 文本理解/命令决策模型。
+#define LLM_CHAT_MODEL                          "Doubao-Seed-1.6-flash"            // Chat Completions 文本理解/命令决策模型。
+#define VOLC_GATEWAY_CHAT_MODEL                 LLM_CHAT_MODEL                     // 兼容旧命名，Chat 请求统一使用 LLM_CHAT_MODEL。
 #define VOLC_GATEWAY_TTS_MODEL                  "doubao-tts"                       // Realtime TTS 模型。
 
 #define VOLC_GATEWAY_ASR_REALTIME_URI           VOLC_GATEWAY_WS_BASE_URL VOLC_GATEWAY_REALTIME_PATH "?model=" VOLC_GATEWAY_ASR_MODEL // ASR Realtime 完整 URI。
@@ -54,7 +55,7 @@
 
 /* LLM 内部能力映射：bridge 只选择能力，不直接写具体模型名。 */
 #define LLM_GATEWAY_ASR_MODEL                  VOLC_GATEWAY_ASR_MODEL              // ASR Realtime 模型。
-#define LLM_GATEWAY_TEXT_MODEL                 VOLC_GATEWAY_CHAT_MODEL             // 文本理解/命令决策模型。
+#define LLM_GATEWAY_TEXT_MODEL                 LLM_CHAT_MODEL                      // 文本理解/命令决策模型。
 #define LLM_GATEWAY_TTS_MODEL                  VOLC_GATEWAY_TTS_MODEL              // TTS Realtime 模型。
 
 /* Mic 音频格式：必须与 mic_adc_test / mic_adc_pcm 的 PCM 输出保持一致。 */
@@ -98,7 +99,7 @@
 #define LLM_GATEWAY_AUTH_BEARER_PREFIX         "Bearer "                          // Authorization Header 前缀。
 
 /* LLM 系统提示词：Mic ASR final 和显式 Chat 查询都会使用。 */
-#define LLM_GATEWAY_SYSTEM_PROMPT              "你是运行在ESP32设备上的中文决策模型。请根据输入上下文给出简短、结构化、可执行的回答。"
+#define LLM_GATEWAY_SYSTEM_PROMPT              "你是 ESP32-C5 设备上的语音助手，请简洁回答。"
 
 #if LLM_GATEWAY_AUDIO_SAMPLE_RATE != 16000
 #error "LLM_GATEWAY_AUDIO_SAMPLE_RATE must stay at 16000 for the current Mic PCM path"

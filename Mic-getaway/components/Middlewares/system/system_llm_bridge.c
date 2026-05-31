@@ -19,7 +19,9 @@ esp_err_t system_llm_bridge_init(void)
 
 esp_err_t ai_system_bridge_init(void)
 {
-    ESP_LOGI(TAG, "system bridge initialized");
+    if (APP_DEBUG_SYSTEM_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "system bridge initialized");
+    }
     return ESP_OK;
 }
 

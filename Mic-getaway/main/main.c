@@ -4,6 +4,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 
+#include "app_debug_config.h"
 #include "mic_adc_test.h"
 #include "mic_llm_bridge.h"
 #include "wifi_manager.h"
@@ -21,13 +22,12 @@ void app_main(void)
 {
     char connected_ssid[33] = {0};
 
-    ESP_LOGI(TAG, "System start");
+    app_debug_apply_log_levels();
 
     // 初始化 WiFi 管理器：内部完成 NVS、网络接口、事件循环和 STA 模式初始化。
     ESP_ERROR_CHECK(wifi_manager_init());
 
     // 持续扫描并连接已保存列表中当前可用且信号最强的 WiFi。
-    ESP_LOGI(TAG, "WiFi connect task start");
     if (wifi_connect_to_ap() != ESP_OK) {
         ESP_LOGE(TAG, "WiFi connect failed");
         while (1) {
@@ -36,14 +36,13 @@ void app_main(void)
     }
 
     if (wifi_get_connected_ssid(connected_ssid, sizeof(connected_ssid))) {
-        ESP_LOGI(TAG, "WiFi connected, SSID: %s", connected_ssid);
+        ESP_LOGI(TAG, "WiFi connected: %s", connected_ssid);
     } else {
         ESP_LOGI(TAG, "WiFi connected");
     }
 
     // 等待 WiFi 连续稳定后再启动 Mic/ASR，避免刚拿到 IP 时就分配 TLS/WebSocket 资源。
     while (!wifi_is_stable()) {
-        ESP_LOGI(TAG, "Waiting for stable WiFi before Mic/ASR start");
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 

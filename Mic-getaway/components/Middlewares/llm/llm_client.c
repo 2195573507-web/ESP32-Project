@@ -18,10 +18,15 @@ enum {
     LLM_CLIENT_ASR_FINAL_BIT = BIT0,
     LLM_CLIENT_ASR_DISCONNECTED_BIT = BIT1,
     LLM_CLIENT_ASR_ERROR_BIT = BIT2,
+    LLM_CLIENT_CHAT_HTTP_403_ERROR_CODE = 264,
     LLM_CLIENT_ASR_FINISH_BITS = LLM_CLIENT_ASR_FINAL_BIT |
                                  LLM_CLIENT_ASR_DISCONNECTED_BIT |
                                  LLM_CLIENT_ASR_ERROR_BIT,
 };
+
+#define LLM_CLIENT_CHAT_HTTP_403_MESSAGE "ASR text to Chat failed: HTTP 403, check gateway Chat permission/model binding"
+#define LLM_CLIENT_ASR_PCM_LOG_INTERVAL_PACKETS 100U
+#define LLM_CLIENT_WEATHER_UNAVAILABLE_REPLY "我现在还没有接入实时天气接口。"
 
 typedef struct {
     bool initialized;
@@ -47,13 +52,36 @@ static llm_client_context_t s_client;
 
 static void llm_client_asr_final_task(void *arg);
 
+static bool llm_client_is_weather_query(const char *text)
+{
+    return text != NULL &&
+           (strstr(text, "天气") != NULL ||
+            strstr(text, "气温") != NULL ||
+            strstr(text, "温度") != NULL ||
+            strstr(text, "下雨") != NULL ||
+            strstr(text, "降雨") != NULL);
+}
+
+static bool llm_client_make_weather_unavailable_reply(const char *user_text,
+                                                      char *out_reply,
+                                                      size_t out_reply_size)
+{
+    if (!llm_client_is_weather_query(user_text) ||
+        out_reply == NULL || out_reply_size == 0) {
+        return false;
+    }
+
+    strlcpy(out_reply, LLM_CLIENT_WEATHER_UNAVAILABLE_REPLY, out_reply_size);
+    return true;
+}
+
 static const char *llm_client_get_model_name(llm_client_capability_t cap)
 {
     switch (cap) {
     case LLM_CLIENT_CAP_ASR:
         return LLM_GATEWAY_ASR_MODEL;
     case LLM_CLIENT_CAP_TEXT:
-        return LLM_GATEWAY_TEXT_MODEL;
+        return LLM_CHAT_MODEL;
     case LLM_CLIENT_CAP_TTS:
         return LLM_GATEWAY_TTS_MODEL;
     default:
@@ -206,15 +234,39 @@ static esp_err_t llm_client_run_text_query(const char *system_prompt,
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (llm_client_make_weather_unavailable_reply(user_text, out_reply, out_reply_size)) {
+        ESP_LOGI(TAG, "LLM request");
+        ESP_LOGI(TAG, "LLM final: %s", out_reply);
+        llm_client_emit(LLM_CLIENT_EVENT_LLM_FINAL_TEXT,
+                        out_reply,
+                        NULL,
+                        0,
+                        0,
+                        NULL);
+        return ESP_OK;
+    }
+
     llm_client_set_state(LLM_CLIENT_STATE_CHAT_REQUESTING);
+    ESP_LOGI(TAG, "LLM request");
     out_reply[0] = '\0';
+    int http_status_code = 0;
     esp_err_t ret = llm_gateway_http_chat_completion(model,
                                                      system_prompt != NULL ? system_prompt : s_client.system_prompt,
                                                      user_text,
                                                      out_reply,
-                                                     out_reply_size);
+                                                     out_reply_size,
+                                                     &http_status_code);
     if (ret != ESP_OK) {
-        llm_client_emit(LLM_CLIENT_EVENT_ERROR, NULL, NULL, 0, ret, "LLM HTTP request failed");
+        int event_code = ret;
+        const char *event_message = "LLM HTTP request failed";
+        if (http_status_code == 403) {
+            event_code = LLM_CLIENT_CHAT_HTTP_403_ERROR_CODE;
+            event_message = LLM_CLIENT_CHAT_HTTP_403_MESSAGE;
+            ESP_LOGW(TAG,
+                     "Chat HTTP 403: state will return IDLE, model=%s",
+                     model);
+        }
+        llm_client_emit(LLM_CLIENT_EVENT_ERROR, NULL, NULL, 0, event_code, event_message);
         llm_client_set_state(LLM_CLIENT_STATE_IDLE);
         return ret;
     }
@@ -224,7 +276,7 @@ static esp_err_t llm_client_run_text_query(const char *system_prompt,
         return ESP_ERR_NOT_FOUND;
     }
 
-    ESP_LOGI(TAG, "LLM FINAL: %s", out_reply);
+    ESP_LOGI(TAG, "LLM final: %s", out_reply);
     llm_client_emit(LLM_CLIENT_EVENT_LLM_FINAL_TEXT,
                     out_reply,
                     NULL,
@@ -262,52 +314,78 @@ static void llm_client_asr_final_task(void *arg)
     strlcpy(chat_text, s_client.pending_chat_text, sizeof(chat_text));
 
     if (chat_text[0] == '\0') {
-        ESP_LOGI(TAG, "ASR final text empty, skip Chat");
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "ASR final text empty, skip Chat");
+        }
     } else if (!LLM_GATEWAY_ENABLE_ASR_TO_CHAT) {
-        ESP_LOGI(TAG, "ASR -> Chat disabled, keep transcript only");
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "ASR -> Chat disabled, keep transcript only");
+        }
     } else {
         const char *model = llm_client_get_model_name(LLM_CLIENT_CAP_TEXT);
         if (!LLM_GATEWAY_ENABLE_TEXT || model == NULL || model[0] == '\0') {
             ESP_LOGW(TAG, "gateway chat reserved but not enabled");
-            s_client.pending_chat_text[0] = '\0';
-            s_client.asr_final_task_handle = NULL;
-            vTaskDelete(NULL);
-            return;
-        }
-
-        ESP_LOGI(TAG, "ASR -> Chat: %s", chat_text);
-        s_client.llm_final_text[0] = '\0';
-        esp_err_t ret = llm_gateway_http_chat_completion(model,
-                                                         s_client.system_prompt,
-                                                         chat_text,
-                                                         s_client.llm_final_text,
-                                                         sizeof(s_client.llm_final_text));
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "ASR -> Chat failed: %s", esp_err_to_name(ret));
-            if (ret == ESP_ERR_INVALID_RESPONSE) {
-                ESP_LOGW(TAG,
-                         "ASR -> Chat rejected by gateway: check API key Chat permission and model=%s binding",
-                         model);
-            }
-            llm_client_emit(LLM_CLIENT_EVENT_ERROR,
-                            NULL,
-                            NULL,
-                            0,
-                            ret,
-                            "ASR text to Chat failed");
-        } else if (s_client.llm_final_text[0] == '\0') {
-            ESP_LOGW(TAG, "ASR -> Chat completed without reply");
         } else {
-            ESP_LOGI(TAG, "LLM FINAL: %s", s_client.llm_final_text);
-            llm_client_emit(LLM_CLIENT_EVENT_LLM_FINAL_TEXT,
-                            s_client.llm_final_text,
-                            NULL,
-                            0,
-                            0,
-                            NULL);
+            ESP_LOGI(TAG, "LLM request");
+            s_client.llm_final_text[0] = '\0';
+            if (llm_client_make_weather_unavailable_reply(chat_text,
+                                                          s_client.llm_final_text,
+                                                          sizeof(s_client.llm_final_text))) {
+                ESP_LOGI(TAG, "LLM final: %s", s_client.llm_final_text);
+                llm_client_emit(LLM_CLIENT_EVENT_LLM_FINAL_TEXT,
+                                s_client.llm_final_text,
+                                NULL,
+                                0,
+                                0,
+                                NULL);
+            } else {
+                llm_client_set_state(LLM_CLIENT_STATE_CHAT_REQUESTING);
+                int http_status_code = 0;
+                esp_err_t ret = llm_gateway_http_chat_completion(model,
+                                                                 s_client.system_prompt,
+                                                                 chat_text,
+                                                                 s_client.llm_final_text,
+                                                                 sizeof(s_client.llm_final_text),
+                                                                 &http_status_code);
+                if (ret != ESP_OK) {
+                    int event_code = ret;
+                    const char *event_message = "ASR text to Chat failed";
+                    if (http_status_code == 403) {
+                        event_code = LLM_CLIENT_CHAT_HTTP_403_ERROR_CODE;
+                        event_message = LLM_CLIENT_CHAT_HTTP_403_MESSAGE;
+                        ESP_LOGW(TAG,
+                                 "ASR -> Chat failed: HTTP 403, check gateway Chat permission/model binding, model=%s",
+                                 model);
+                    } else {
+                        ESP_LOGW(TAG,
+                                 "ASR -> Chat failed: ret=%s http_status=%d",
+                                 esp_err_to_name(ret),
+                                 http_status_code);
+                    }
+                    llm_client_emit(LLM_CLIENT_EVENT_ERROR,
+                                    NULL,
+                                    NULL,
+                                    0,
+                                    event_code,
+                                    event_message);
+                } else if (s_client.llm_final_text[0] == '\0') {
+                    ESP_LOGW(TAG, "ASR -> Chat completed without reply");
+                } else {
+                    ESP_LOGI(TAG, "LLM final: %s", s_client.llm_final_text);
+                    llm_client_emit(LLM_CLIENT_EVENT_LLM_FINAL_TEXT,
+                                    s_client.llm_final_text,
+                                    NULL,
+                                    0,
+                                    0,
+                                    NULL);
+                }
+            }
         }
     }
 
+    if (s_client.state == LLM_CLIENT_STATE_CHAT_REQUESTING) {
+        llm_client_set_state(LLM_CLIENT_STATE_IDLE);
+    }
     s_client.pending_chat_text[0] = '\0';
     s_client.asr_final_task_handle = NULL;
     vTaskDelete(NULL);
@@ -325,7 +403,7 @@ static esp_err_t llm_client_handle_asr_final(const char *text)
     }
 
     strlcpy(s_client.asr_final_text, text, sizeof(s_client.asr_final_text));
-    ESP_LOGI(TAG, "ASR FINAL: %s", s_client.asr_final_text);
+    ESP_LOGI(TAG, "ASR final: %s", s_client.asr_final_text);
     llm_client_emit(LLM_CLIENT_EVENT_ASR_FINAL_TEXT,
                     s_client.asr_final_text,
                     NULL,
@@ -340,11 +418,15 @@ static esp_err_t llm_client_handle_asr_final(const char *text)
 static esp_err_t llm_client_start_asr_chat_if_needed(void)
 {
     if (!s_client.asr_final_received || s_client.asr_final_text[0] == '\0') {
-        ESP_LOGI(TAG, "ASR final text empty, skip Chat");
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "ASR final text empty, skip Chat");
+        }
         return ESP_OK;
     }
     if (!LLM_GATEWAY_ENABLE_ASR_TO_CHAT) {
-        ESP_LOGI(TAG, "ASR -> Chat disabled, keep transcript only");
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "ASR -> Chat disabled, keep transcript only");
+        }
         return ESP_OK;
     }
 
@@ -363,10 +445,12 @@ static EventBits_t llm_client_wait_asr_finish_events(void)
     EventBits_t collected_bits = 0;
     bool final_seen = false;
 
-    ESP_LOGI(TAG,
-             "ASR finish receive loop start: timeout_ms=%d drain_quiet_ms=%d",
-             LLM_GATEWAY_WS_FINAL_TIMEOUT_MS,
-             LLM_GATEWAY_WS_DRAIN_QUIET_MS);
+    if (APP_DEBUG_LLM_CLIENT) {
+        ESP_LOGI(TAG,
+                 "ASR finish receive loop start: timeout_ms=%d drain_quiet_ms=%d",
+                 LLM_GATEWAY_WS_FINAL_TIMEOUT_MS,
+                 LLM_GATEWAY_WS_DRAIN_QUIET_MS);
+    }
 
     while ((int32_t)(deadline_tick - xTaskGetTickCount()) > 0) {
         TickType_t now = xTaskGetTickCount();
@@ -391,7 +475,9 @@ static EventBits_t llm_client_wait_asr_finish_events(void)
 
         now = xTaskGetTickCount();
         if (final_seen && (now - s_client.asr_last_event_tick) >= quiet_ticks) {
-            ESP_LOGI(TAG, "ASR finish receive loop drained after final");
+            if (APP_DEBUG_LLM_CLIENT) {
+                ESP_LOGI(TAG, "ASR finish receive loop drained after final");
+            }
             break;
         }
     }
@@ -465,14 +551,20 @@ static void llm_client_tts_ws_event_cb(const llm_gateway_tts_ws_event_t *event, 
 
     switch (event->type) {
     case LLM_GATEWAY_TTS_WS_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "TTS connected");
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "TTS connected");
+        }
         break;
     case LLM_GATEWAY_TTS_WS_EVENT_SESSION_UPDATED:
-        ESP_LOGI(TAG, "TTS session updated");
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "TTS session updated");
+        }
         break;
     case LLM_GATEWAY_TTS_WS_EVENT_AUDIO_DELTA:
         if (event->audio != NULL && event->audio_len > 0) {
-            ESP_LOGI(TAG, "TTS AUDIO chunk bytes=%u", (unsigned int)event->audio_len);
+            if (APP_DEBUG_LLM_GATEWAY_AUDIO) {
+                ESP_LOGI(TAG, "TTS AUDIO chunk bytes=%u", (unsigned int)event->audio_len);
+            }
             llm_client_emit(LLM_CLIENT_EVENT_TTS_AUDIO,
                             NULL,
                             event->audio,
@@ -482,10 +574,14 @@ static void llm_client_tts_ws_event_cb(const llm_gateway_tts_ws_event_t *event, 
         }
         break;
     case LLM_GATEWAY_TTS_WS_EVENT_AUDIO_DONE:
-        ESP_LOGI(TAG, "TTS audio done");
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "TTS audio done");
+        }
         break;
     case LLM_GATEWAY_TTS_WS_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "TTS disconnected");
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "TTS disconnected");
+        }
         break;
     case LLM_GATEWAY_TTS_WS_EVENT_ERROR:
     default:
@@ -522,7 +618,9 @@ esp_err_t llm_client_init(const llm_client_config_t *config)
 
     char key_summary[48] = {0};
     llm_gateway_protocol_make_key_summary(key_summary, sizeof(key_summary));
-    ESP_LOGI(TAG, "llm_client initialized, key %s", key_summary);
+    if (APP_DEBUG_LLM_CLIENT) {
+        ESP_LOGI(TAG, "llm_client initialized, key %s", key_summary);
+    }
     if (llm_gateway_protocol_config_has_placeholders()) {
         ESP_LOGW(TAG, "llm_config.h still has placeholder gateway values");
     }
@@ -550,7 +648,9 @@ esp_err_t llm_client_start_asr_session(void)
     }
     if (s_client.state != LLM_CLIENT_STATE_IDLE) {
         if (s_client.state == LLM_CLIENT_STATE_ASR_FINISHING) {
-            ESP_LOGI(TAG, "ASR busy finishing previous session");
+            if (APP_DEBUG_LLM_CLIENT) {
+                ESP_LOGI(TAG, "ASR busy finishing previous session");
+            }
         } else {
             ESP_LOGW(TAG, "ASR start rejected: state=%s", llm_client_state_name(s_client.state));
         }
@@ -617,7 +717,8 @@ esp_err_t llm_client_send_asr_pcm(const int16_t *pcm, size_t samples)
 
     s_client.pcm_packet_count++;
     esp_err_t ret = llm_gateway_ws_send_pcm16(pcm, samples, LLM_GATEWAY_AUDIO_SAMPLE_RATE);
-    if ((s_client.pcm_packet_count % 10U) == 0U || ret != ESP_OK) {
+    if (APP_DEBUG_LLM_GATEWAY_AUDIO &&
+        ((s_client.pcm_packet_count % LLM_CLIENT_ASR_PCM_LOG_INTERVAL_PACKETS) == 0U || ret != ESP_OK)) {
         ESP_LOGI(TAG,
                  "ASR PCM send: pcm_packet_count=%u pcm_bytes=%u sample_rate=%d channels=%d send_result=%s llm_client_state=%s",
                  (unsigned int)s_client.pcm_packet_count,
@@ -656,7 +757,9 @@ esp_err_t llm_client_finish_asr_session(void)
     esp_err_t finish_ret = ESP_OK;
     if (s_client.ws_started) {
         finish_ret = llm_gateway_ws_finish();
-        ESP_LOGI(TAG, "ASR finalize send result: %s", esp_err_to_name(finish_ret));
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "ASR finalize send result: %s", esp_err_to_name(finish_ret));
+        }
         if (finish_ret != ESP_OK) {
             ESP_LOGW(TAG, "ASR WS finish failed: %s", esp_err_to_name(finish_ret));
         }
@@ -671,7 +774,9 @@ esp_err_t llm_client_finish_asr_session(void)
     }
 
     if (bits & LLM_CLIENT_ASR_FINAL_BIT) {
-        ESP_LOGI(TAG, "ASR final transcript receive result: received");
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "ASR final transcript receive result: received");
+        }
     } else if (bits & LLM_CLIENT_ASR_ERROR_BIT) {
         ESP_LOGW(TAG, "ASR final transcript receive result: websocket error");
     } else if (bits & LLM_CLIENT_ASR_DISCONNECTED_BIT) {
@@ -681,7 +786,17 @@ esp_err_t llm_client_finish_asr_session(void)
                  "ASR final transcript receive result: timeout after %d ms",
                  LLM_GATEWAY_WS_FINAL_TIMEOUT_MS);
         if (s_client.asr_partial_received && s_client.asr_last_partial_text[0] != '\0') {
-            ESP_LOGI(TAG, "ASR timeout with latest partial transcript: %s", s_client.asr_last_partial_text);
+            strlcpy(s_client.asr_final_text,
+                    s_client.asr_last_partial_text,
+                    sizeof(s_client.asr_final_text));
+            s_client.asr_final_received = true;
+            ESP_LOGW(TAG, "ASR timeout fallback to latest partial transcript: %s", s_client.asr_final_text);
+            llm_client_emit(LLM_CLIENT_EVENT_ASR_FINAL_TEXT,
+                            s_client.asr_final_text,
+                            NULL,
+                            0,
+                            0,
+                            NULL);
         }
     }
 
@@ -689,11 +804,9 @@ esp_err_t llm_client_finish_asr_session(void)
     if (s_client.ws_started) {
         close_ret = llm_gateway_ws_stop();
         s_client.ws_started = false;
-        if (close_ret == ESP_OK) {
-            ESP_LOGI(TAG, "ASR WebSocket close result: %s", esp_err_to_name(close_ret));
-        } else {
-            ESP_LOGW(TAG,
-                     "ASR WebSocket close result: %s, session resources cleaned",
+        if (APP_DEBUG_LLM_GATEWAY_WS) {
+            ESP_LOGD(TAG,
+                     "ASR WebSocket close result: %s",
                      esp_err_to_name(close_ret));
         }
     }
@@ -782,7 +895,9 @@ esp_err_t llm_client_json_context_request(const char *source, const char *json_c
     if (written < 0 || (size_t)written >= sizeof(context)) {
         return ESP_ERR_INVALID_SIZE;
     }
-    ESP_LOGI(TAG, "JSON context request: source=%s len=%u", source, (unsigned int)strlen(json_context));
+    if (APP_DEBUG_LLM_CLIENT) {
+        ESP_LOGI(TAG, "JSON context request: source=%s len=%u", source, (unsigned int)strlen(json_context));
+    }
     return llm_client_text_request(context);
 }
 
@@ -823,7 +938,9 @@ esp_err_t llm_client_tts_text(const char *text)
     }
 
     llm_client_set_state(LLM_CLIENT_STATE_TTS_REQUESTING);
-    ESP_LOGI(TAG, "TTS request start: model=%s text_len=%u", model, (unsigned int)strlen(text));
+    if (APP_DEBUG_LLM_CLIENT) {
+        ESP_LOGI(TAG, "TTS request start: model=%s text_len=%u", model, (unsigned int)strlen(text));
+    }
     llm_gateway_tts_ws_config_t tts_config = {
         .tts_model = model,
         .event_cb = llm_client_tts_ws_event_cb,
@@ -839,7 +956,9 @@ esp_err_t llm_client_tts_text(const char *text)
                         ret,
                         "TTS request failed");
     } else {
-        ESP_LOGI(TAG, "TTS request done");
+        if (APP_DEBUG_LLM_CLIENT) {
+            ESP_LOGI(TAG, "TTS request done");
+        }
     }
     llm_client_set_state(LLM_CLIENT_STATE_IDLE);
     return ret;

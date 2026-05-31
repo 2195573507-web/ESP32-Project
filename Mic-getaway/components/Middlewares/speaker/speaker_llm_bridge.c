@@ -9,7 +9,9 @@ static const char *TAG = "speaker_llm_bridge";
 
 esp_err_t speaker_llm_bridge_init(void)
 {
-    ESP_LOGI(TAG, "speaker bridge reserved, tts_enabled=%d", llm_client_is_tts_enabled());
+    if (APP_DEBUG_SPEAKER_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "speaker bridge reserved, tts_enabled=%d", llm_client_is_tts_enabled());
+    }
     return ESP_OK;
 }
 
@@ -19,7 +21,9 @@ esp_err_t speaker_llm_bridge_speak_text(const char *text)
         return ESP_ERR_INVALID_ARG;
     }
 
-    ESP_LOGI(TAG, "speaker speak_text request len=%u", (unsigned int)strlen(text));
+    if (APP_DEBUG_SPEAKER_LLM_BRIDGE) {
+        ESP_LOGI(TAG, "speaker speak_text request len=%u", (unsigned int)strlen(text));
+    }
     return llm_client_tts_text(text);
 }
 
